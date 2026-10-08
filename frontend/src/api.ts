@@ -76,13 +76,20 @@ export function useApi<T>(path: string | null, ms = 5000) {
 }
 
 // ---------------------------------------------------------------- types
-export type NumberRef = { id: number; phone_number: string; status: string; connected_count: number; provider: string };
+export type NumberRef = {
+  id: number;
+  phone_number: string;
+  status: string;
+  connected_count: number;
+  provider: string;
+  missing_on_bolna: boolean;
+};
 export type AgentRow = {
   id: number;
   bolna_agent_id: string;
   name: string;
   number: NumberRef | null;
-  status: "ready" | "near_limit" | "on_call" | "pool_empty" | "no_number";
+  status: "ready" | "near_limit" | "on_call" | "pool_empty" | "no_number" | "number_missing";
   on_call: boolean;
   active_calls: number;
   pending_switch: boolean;
@@ -92,12 +99,18 @@ export type NumberRow = {
   id: number;
   phone_number: string;
   provider: string;
-  status: "available" | "in_use" | "limit_reached";
+  status: "available" | "in_use" | "limit_reached" | "discovered" | "ignored";
   connected_count: number;
   total_calls: number;
   agents_served: number;
   threshold: number;
   linked: boolean;
+  linked_in_bolna: boolean;
+  bolna_linked_agent_id: string | null;
+  allow_auto_switch: boolean;
+  missing_on_bolna: boolean;
+  missing_since: string | null;
+  discovered_at: string | null;
   added_at: string;
   used_by: { id: number; name: string; on_call: boolean; pending_switch: boolean } | null;
 };
@@ -126,6 +139,34 @@ export type HistoryRow = {
   end_reason: string | null;
 };
 
+export type SyncRun = {
+  id: number;
+  status: "success" | "failed";
+  started_at: string;
+  finished_at: string | null;
+  total_on_bolna: number;
+  new_count: number;
+  missing_count: number;
+  skipped_invalid_count: number;
+  error_message: string | null;
+  skipped_numbers: string[];
+};
+export type SyncStatus = {
+  running: boolean;
+  last_run: SyncRun | null;
+  last_success: SyncRun | null;
+  discovered_count: number;
+  ignored_count: number;
+};
+export type NumberPage = {
+  threshold: number;
+  items: NumberRow[];
+  total: number;
+  page: number;
+  page_size: number;
+  unlinked_total?: number;
+};
+
 export const PHONE_RE = /^\+91[0-9]{10}$/;
 export const PHONE_HINT = "Use +91 followed by 10 digits";
 
@@ -135,4 +176,15 @@ export function fmtTime(iso: string | null | undefined) {
 }
 export function fmtDuration(d: number | null) {
   return d === null || d === undefined ? "-" : `${Math.round(d)}s`;
+}
+
+export function timeAgo(iso: string | null | undefined) {
+  if (!iso) return "never";
+  const mins = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 60000));
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} minute${mins === 1 ? "" : "s"} ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs} hour${hrs === 1 ? "" : "s"} ago`;
+  const days = Math.round(hrs / 24);
+  return `${days} day${days === 1 ? "" : "s"} ago`;
 }

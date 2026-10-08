@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, String, text,
+    Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, String, Text, text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -26,7 +26,8 @@ class Setting(Base):
 class Number(Base):
     __tablename__ = "numbers"
     __table_args__ = (
-        CheckConstraint("status IN ('available','in_use','limit_reached')", name="ck_number_status"),
+        CheckConstraint("status IN ('available','in_use','limit_reached','discovered','ignored')",
+        name="ck_number_status"),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     phone_number: Mapped[str] = mapped_column(String(16), unique=True)
@@ -36,6 +37,15 @@ class Number(Base):
     total_calls: Mapped[int] = mapped_column(Integer, default=0)
     bolna_linked_agent_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     added_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    # Sync from Bolna. 'discovered' / 'ignored' rows are NOT part of the pool.
+    linked_in_bolna: Mapped[bool] = mapped_column(Boolean, default=False)
+    allow_auto_switch: Mapped[bool] = mapped_column(Boolean, default=True)
+    missing_on_bolna: Mapped[bool] = mapped_column(Boolean, default=False)
+    missing_since: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    discovered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+POOL_STATUSES = ("available", "in_use", "limit_reached")
 
 
 class Agent(Base):
@@ -102,3 +112,18 @@ class Call(Base):
 
     agent: Mapped[Agent] = relationship()
     number: Mapped[Number] = relationship()
+
+
+class SyncRun(Base):
+    __tablename__ = "sync_runs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    status: Mapped[str] = mapped_column(String(16))  # success | failed
+    total_on_bolna: Mapped[int] = mapped_column(Integer, default=0)
+    new_count: Mapped[int] = mapped_column(Integer, default=0)
+    missing_count: Mapped[int] = mapped_column(Integer, default=0)
+    skipped_invalid_count: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # JSON list of the raw values that were skipped (shown in the UI, never logged)
+    skipped_numbers: Mapped[str | None] = mapped_column(Text, nullable=True)

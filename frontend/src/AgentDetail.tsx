@@ -32,6 +32,7 @@ export default function AgentDetail() {
 
   function reason(n: NumberRow): string | null {
     if (cur && n.id === cur.id) return "Current number.";
+    if (n.missing_on_bolna) return "Not on Bolna.";
     if (n.used_by) return `Used by ${n.used_by.name}${n.used_by.on_call ? ", on a call" : ""}. Cannot be taken.`;
     if (n.status === "limit_reached" || n.connected_count >= threshold) return `${n.connected_count} / ${threshold} connected calls. Cannot be assigned.`;
     return null;
@@ -74,7 +75,7 @@ export default function AgentDetail() {
   }
 
   const recipBad = recipient.length > 0 && !PHONE_RE.test(recipient.trim());
-  const canCall = !!cur && agent.status !== "pool_empty" && !agent.pending_switch;
+  const canCall = !!cur && agent.status !== "pool_empty" && agent.status !== "number_missing" && !agent.pending_switch;
 
   return (
     <>
@@ -93,6 +94,7 @@ export default function AgentDetail() {
         </div>
         {locked && <p className="notice"><LockIcon /> This agent is on a call. Its number is locked until the call ends, then it can be changed.</p>}
         {agent.pending_switch && <p className="notice">The number reached its limit. The agent switches to the next available number when the current call ends.</p>}
+        {agent.status === "number_missing" && <p className="flag" role="alert">This agent's number is not on your Bolna account any more, so calls are blocked. Nothing was switched automatically: change its number by hand.</p>}
         {agent.status === "pool_empty" && <p className="flag" role="alert">No number is available for this agent. Add a number to the pool or reset one and it is filled automatically.</p>}
 
         {panel === "change" && (

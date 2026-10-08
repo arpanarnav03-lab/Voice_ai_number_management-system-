@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import itertools
 import time
 
@@ -26,6 +27,7 @@ SIM_NUMBERS = [
 class SimulatedBolna:
     def __init__(self, speed: float = 1.0):
         self.speed = speed  # >1 makes simulated calls finish faster
+        self._sync_round = 0
 
     async def get_me(self) -> dict:
         return {"id": "sim", "name": "Simulated Bolna", "email": "sim@example.invalid",
@@ -33,6 +35,24 @@ class SimulatedBolna:
 
     async def list_phone_numbers(self) -> list[dict]:
         return [dict(n) for n in SIM_NUMBERS]
+
+    async def list_all_phone_numbers(self) -> list[dict]:
+        """Scripted for the sync, one step per call, repeating:
+        1. the normal list plus an invalid number and an extra unlinked one
+        2. same, but +918000000006 has disappeared
+        3. an empty response (the sync must refuse to act on it)
+        """
+        step = self._sync_round % 3
+        self._sync_round += 1
+        if step == 2:
+            return []
+        nums = [dict(n) for n in SIM_NUMBERS] + [
+            {"phone_number": "+9180000", "telephony_provider": "vobiz", "agent_id": None},
+            {"phone_number": "+918000000100", "telephony_provider": "vobiz", "agent_id": None},
+        ]
+        if step == 1:
+            nums = [n for n in nums if n["phone_number"] != "+918000000006"]
+        return nums
 
     async def get_agent(self, agent_id: str) -> dict | None:
         if agent_id.lower().startswith("missing"):
@@ -97,12 +117,23 @@ class FakeBolnaClient:
         self.missing_agents: set[str] = set()
         self.concurrency = {"max": 2, "current": 0}
         self._ids = itertools.count(1)
+        self.list_error: Exception | None = None  # raised by list_all_phone_numbers
+        self.list_delay: float = 0.0  # seconds, to hold a sync open
+        self.list_calls = 0
 
     async def get_me(self) -> dict:
         return {"id": "fake", "concurrency": dict(self.concurrency)}
 
     async def list_phone_numbers(self) -> list[dict]:
         return [dict(n) for n in self.numbers]
+
+    async def list_all_phone_numbers(self) -> list[dict]:
+        self.list_calls += 1
+        if self.list_delay:
+            await asyncio.sleep(self.list_delay)
+        if self.list_error is not None:
+            raise self.list_error
+        return [dict(n) if isinstance(n, dict) else n for n in self.numbers]
 
     async def get_agent(self, agent_id: str) -> dict | None:
         if agent_id in self.missing_agents:

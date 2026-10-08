@@ -8,10 +8,10 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
-from . import auth, services
+from . import auth, services, sync
 from .bolna_client import AgentNotFoundOnBolna, BolnaError
 from .errors import AppError
-from .models import Agent, Assignment, Call, Number
+from .models import POOL_STATUSES, Agent, Assignment, Call, Number
 from .validation import mask_phone
 
 log = logging.getLogger("bnm.api")
@@ -43,6 +43,8 @@ def agent_rows(s, agents: list[Agent], threshold: int) -> list[dict]:
         ac = active.get(a.id, 0)
         if ac > 0:
             status = "on_call"
+        elif n is not None and n.missing_on_bolna:
+            status = "number_missing"
         elif a.pool_empty:
             status = "pool_empty"
         elif n is None:
@@ -55,7 +57,8 @@ def agent_rows(s, agents: list[Agent], threshold: int) -> list[dict]:
             "id": a.id, "bolna_agent_id": a.bolna_agent_id, "name": a.name,
             "number": None if n is None else {
                 "id": n.id, "phone_number": n.phone_number, "status": n.status,
-                "connected_count": n.connected_count, "provider": n.provider},
+                "connected_count": n.connected_count, "provider": n.provider,
+                "missing_on_bolna": n.missing_on_bolna},
             "status": status, "on_call": ac > 0, "active_calls": ac,
             "pending_switch": a.pending_switch, "last_used": iso(last.get(a.id)),
         })
@@ -75,6 +78,9 @@ def number_rows(s, numbers: list[Number], threshold: int) -> list[dict]:
             "connected_count": n.connected_count, "total_calls": n.total_calls,
             "agents_served": served.get(n.id, 0), "threshold": threshold,
             "linked": n.bolna_linked_agent_id is not None, "added_at": iso(n.added_at),
+            "linked_in_bolna": n.linked_in_bolna, "bolna_linked_agent_id": n.bolna_linked_agent_id,
+            "allow_auto_switch": n.allow_auto_switch, "missing_on_bolna": n.missing_on_bolna,
+            "missing_since": iso(n.missing_since), "discovered_at": iso(n.discovered_at),
             "used_by": None if h is None else {
                 "id": h.id, "name": h.name, "on_call": active.get(h.id, 0) > 0,
                 "pending_switch": h.pending_switch},
@@ -168,11 +174,34 @@ class NumberBody(BaseModel):
 
 
 @protected.get("/numbers")
-def list_numbers(request: Request):
+def list_numbers(request: Request, status: str | None = None, q: str = "", page: int = 1,
+                 page_size: int = 50):
+    """Without `status`: the whole pool (discovered / ignored numbers are not in it).
+    With `status`: that status only, paginated and searchable."""
     with request.app.state.db.session() as s:
         th = services.get_threshold(s)
-        nums = s.scalars(select(Number).order_by(Number.added_at, Number.id)).all()
-        return {"threshold": th, "items": number_rows(s, nums, th)}
+        if status is None:
+            nums = s.scalars(select(Number).where(Number.status.in_(POOL_STATUSES))
+                             .order_by(Number.added_at, Number.id)).all()
+            return {"threshold": th, "items": number_rows(s, nums, th)}
+        if status not in (*POOL_STATUSES, "discovered", "ignored"):
+            raise AppError("VALIDATION_ERROR", "Invalid input: status", 422)
+        page_size = min(max(page_size, 1), 200)
+        page = max(page, 1)
+        flt = [Number.status == status]
+        if q.strip():
+            flt.append(Number.phone_number.contains(q.strip(), autoescape=True))
+        total = s.scalar(select(func.count()).select_from(Number).where(*flt)) or 0
+        order = (Number.discovered_at, Number.id) if status in ("discovered", "ignored") \
+            else (Number.added_at, Number.id)
+        nums = s.scalars(select(Number).where(*flt).order_by(*order)
+                         .limit(page_size).offset((page - 1) * page_size)).all()
+        out = {"threshold": th, "items": number_rows(s, nums, th), "total": total,
+               "page": page, "page_size": page_size}
+        if status == "discovered":
+            out["unlinked_total"] = s.scalar(select(func.count()).select_from(Number).where(
+                Number.status == "discovered", Number.linked_in_bolna.is_(False))) or 0
+        return out
 
 
 @protected.post("/numbers", status_code=201)
@@ -218,12 +247,84 @@ def number_detail(number_id: int, request: Request):
         return {"number": number_rows(s, [n], th)[0], "agents": agents, "calls": call_rows(s, calls)}
 
 
+class ApproveBody(BaseModel):
+    confirm_linked: bool = False
+
+
+class ApproveManyBody(BaseModel):
+    ids: list[int] | None = None
+    all_unlinked: bool = False
+    confirm_linked: bool = False
+
+
+class IdsBody(BaseModel):
+    ids: list[int] = Field(max_length=1000)
+
+
+class AutoSwitchBody(BaseModel):
+    allow: bool
+    confirm: bool = False
+
+
+@protected.post("/numbers/approve")
+def approve_numbers(body: ApproveManyBody, request: Request):
+    if not body.all_unlinked and not body.ids:
+        raise AppError("VALIDATION_ERROR", "Invalid input: ids", 422)
+    with request.app.state.db.session() as s:
+        return services.approve_many(s, body.ids, body.all_unlinked, body.confirm_linked)
+
+
+@protected.post("/numbers/ignore")
+def ignore_numbers(body: IdsBody, request: Request):
+    with request.app.state.db.session() as s:
+        return {"ignored": services.ignore_many(s, body.ids)}
+
+
+@protected.post("/numbers/{number_id}/approve")
+def approve_number(number_id: int, request: Request, body: ApproveBody | None = None):
+    with request.app.state.db.session() as s:
+        n = services.approve_number(s, number_id, bool(body and body.confirm_linked))
+        return number_rows(s, [n], services.get_threshold(s))[0]
+
+
+@protected.post("/numbers/{number_id}/ignore")
+def ignore_number(number_id: int, request: Request):
+    with request.app.state.db.session() as s:
+        n = services.ignore_number(s, number_id)
+        return number_rows(s, [n], services.get_threshold(s))[0]
+
+
+@protected.post("/numbers/{number_id}/restore")
+def restore_number(number_id: int, request: Request):
+    with request.app.state.db.session() as s:
+        n = services.restore_number(s, number_id)
+        return number_rows(s, [n], services.get_threshold(s))[0]
+
+
+@protected.put("/numbers/{number_id}/auto-switch")
+def put_auto_switch(number_id: int, body: AutoSwitchBody, request: Request):
+    with request.app.state.db.session() as s:
+        n = services.set_auto_switch(s, number_id, body.allow, body.confirm)
+        return number_rows(s, [n], services.get_threshold(s))[0]
+
+
 @protected.post("/numbers/{number_id}/reset")
 def reset_number(number_id: int, request: Request):
     with request.app.state.db.session() as s:
         n = services.reset_number(s, number_id)
         th = services.get_threshold(s)
         return number_rows(s, [n], th)[0]
+
+
+# ------------------------------------------------------------------ sync
+@protected.post("/sync/run")
+async def sync_run(request: Request):
+    return await sync.run_sync(request.app.state)
+
+
+@protected.get("/sync/status")
+def sync_status(request: Request):
+    return sync.status(request.app.state.db)
 
 
 # ------------------------------------------------------------------ agents

@@ -1,13 +1,16 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { ApiError, NumberRow, PHONE_HINT, PHONE_RE, api, useApi } from "./api";
-import { CountBar, Empty, LockIcon, TableBox, numberPill, useToast } from "./ui";
+import { ApiError, NumberRow, PHONE_HINT, PHONE_RE, SyncStatus, api, timeAgo, useApi } from "./api";
+import DiscoveredList from "./DiscoveredList";
+import { CountBar, Empty, LockIcon, MissingNote, TableBox, numberPill, useToast } from "./ui";
 
-type Filter = "all" | "in_use" | "available" | "limit_reached";
+type Filter = "all" | "in_use" | "available" | "limit_reached" | "discovered";
 
 export default function PoolTab() {
   const toast = useToast();
   const numbers = useApi<{ threshold: number; items: NumberRow[] }>("/api/numbers");
+  const syncSt = useApi<SyncStatus>("/api/sync/status", 5000);
+  const [syncing, setSyncing] = useState(false);
   const [filter, setFilter] = useState<Filter>("all");
   const [thr, setThr] = useState("");
   const [thrDirty, setThrDirty] = useState(false);
@@ -21,8 +24,14 @@ export default function PoolTab() {
     if (numbers.data && !thrDirty) setThr(String(numbers.data.threshold));
   }, [numbers.data, thrDirty]);
 
-  const count = (f: Filter) => (f === "all" ? items.length : items.filter((n) => n.status === f).length);
+  const sync = syncSt.data;
+  const discoveredCount = sync?.discovered_count ?? 0;
+  const count = (f: Filter) =>
+    f === "discovered" ? discoveredCount : f === "all" ? items.length : items.filter((n) => n.status === f).length;
   const shown = filter === "all" ? items : items.filter((n) => n.status === filter);
+  const ok = sync?.last_success ?? null;
+  const failed = sync?.last_run?.status === "failed" ? sync.last_run : null;
+  const isSyncing = syncing || !!sync?.running;
   const thrNum = Number(thr);
   const thrValid = Number.isInteger(thrNum) && thrNum >= 1;
   const phoneBad = phoneTouched && phone.length > 0 && !PHONE_RE.test(phone.trim());
@@ -35,6 +44,21 @@ export default function PoolTab() {
       numbers.reload();
     } catch (e) {
       toast((e as ApiError).message, "error");
+    }
+  }
+
+  async function runSync() {
+    setSyncing(true);
+    try {
+      await api.post("/api/sync/run");
+    } catch (e) {
+      const err = e as ApiError;
+      if (err.code === "SYNC_ALREADY_RUNNING") toast(err.message, "warn");
+      else if (err.code !== "SYNC_FAILED") toast(err.message, "error"); // a failed run shows in the alert below
+    } finally {
+      setSyncing(false);
+      syncSt.reload();
+      numbers.reload();
     }
   }
 
@@ -64,7 +88,7 @@ export default function PoolTab() {
     }
   }
 
-  const chips: [Filter, string][] = [["all", "All"], ["in_use", "In use"], ["available", "Available"], ["limit_reached", "Limit reached"]];
+  const chips: [Filter, string][] = [["all", "All"], ["in_use", "In use"], ["available", "Available"], ["limit_reached", "Limit reached"], ["discovered", "Discovered"]];
 
   return (
     <>
@@ -99,7 +123,27 @@ export default function PoolTab() {
       </div>
 
       <section className="card" aria-labelledby="pool-h">
-        <h2 id="pool-h">Pool</h2>
+        <div className="head-row">
+          <h2 id="pool-h">Pool</h2>
+          <button className="btn" disabled={isSyncing} onClick={runSync}>{isSyncing ? "Syncing..." : "Sync from Bolna"}</button>
+          <span className="syncline" role="status">
+            {ok
+              ? `Last synced ${timeAgo(ok.finished_at)}. ${ok.total_on_bolna} on Bolna, ${ok.new_count} new, ${ok.missing_count} missing, ${ok.skipped_invalid_count} skipped.`
+              : sync ? "Not synced yet." : ""}
+          </span>
+        </div>
+        {failed && (
+          <div className="flag" role="alert">
+            <p>Sync failed: {failed.error_message}. Nothing was changed.{" "}
+              {ok ? `Last successful sync: ${timeAgo(ok.finished_at)}.` : "There has been no successful sync yet."}</p>
+          </div>
+        )}
+        {ok && ok.skipped_invalid_count > 0 && (
+          <details className="skipnote">
+            <summary>{ok.skipped_invalid_count} {ok.skipped_invalid_count === 1 ? "number" : "numbers"} skipped because {ok.skipped_invalid_count === 1 ? "it is" : "they are"} not +91 followed by 10 digits</summary>
+            <ul>{ok.skipped_numbers.map((v, i) => <li key={i}>{v}</li>)}</ul>
+          </details>
+        )}
         <div className="chips" role="group" aria-label="Filter numbers">
           {chips.map(([f, label]) => (
             <button key={f} className="chip" aria-pressed={filter === f} onClick={() => setFilter(f)}>
@@ -108,7 +152,9 @@ export default function PoolTab() {
           ))}
         </div>
         {numbers.error && <p className="field-err" role="alert">{numbers.error.message}</p>}
-        {!items.length ? (
+        {filter === "discovered" ? (
+          <DiscoveredList ignoredCount={sync?.ignored_count ?? 0} onChanged={() => { numbers.reload(); syncSt.reload(); }} />
+        ) : !items.length ? (
           <Empty>The pool is empty. Add a number above to get started.</Empty>
         ) : !shown.length ? (
           <Empty>No numbers match this filter.</Empty>
@@ -121,8 +167,8 @@ export default function PoolTab() {
               <tbody>
                 {shown.map((n) => (
                   <tr key={n.id}>
-                    <td className="mono"><Link to={`/numbers/${n.id}`}>{n.phone_number}</Link>{n.linked && <span className="sub">Linked to an agent in Bolna</span>}</td>
-                    <td>{numberPill(n)}</td>
+                    <td className="mono"><Link to={`/numbers/${n.id}`}>{n.phone_number}</Link>{n.linked_in_bolna && <span className="sub">Linked in Bolna</span>}</td>
+                    <td>{numberPill(n)}<MissingNote n={n} /></td>
                     <td>
                       {n.used_by ? <>{n.used_by.on_call && <LockIcon />} <Link to={`/agents/${n.used_by.id}`}>{n.used_by.name}</Link>
                         {n.used_by.pending_switch && <span className="sub">Switching after this call</span>}</> : <span className="muted">-</span>}

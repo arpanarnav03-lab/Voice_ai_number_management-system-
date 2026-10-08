@@ -1,6 +1,7 @@
+import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ApiError, CallRow, NumberRow, api, fmtTime, useApi } from "./api";
-import { CallTable, CountBar, Empty, REASON_TEXT, TableBox, numberPill, useToast } from "./ui";
+import { CallTable, ConfirmDialog, CountBar, Empty, MissingNote, REASON_TEXT, TableBox, numberPill, useToast } from "./ui";
 
 type Detail = {
   number: NumberRow;
@@ -12,6 +13,8 @@ export default function NumberDetail() {
   const { id } = useParams();
   const toast = useToast();
   const d = useApi<Detail>(`/api/numbers/${id}`);
+  const [confirmSwitch, setConfirmSwitch] = useState(false);
+  const [busy, setBusy] = useState(false);
 
   if (d.error && !d.data) {
     return <section className="card"><p role="alert" className="field-err">{d.error.message}</p><Link to="/pool">Back to the pool</Link></section>;
@@ -29,6 +32,20 @@ export default function NumberDetail() {
     }
   }
 
+  async function setAutoSwitch(allow: boolean) {
+    setBusy(true);
+    try {
+      await api.put(`/api/numbers/${n.id}/auto-switch`, { allow, confirm: true });
+      toast(`Auto-switching ${allow ? "allowed" : "turned off"} for ${n.phone_number}.`);
+      d.reload();
+    } catch (e) {
+      toast((e as ApiError).message, "error");
+    } finally {
+      setBusy(false);
+      setConfirmSwitch(false);
+    }
+  }
+
   return (
     <>
       <div className="crumbs"><Link to="/pool">Number Pool</Link> / {n.phone_number}</div>
@@ -36,12 +53,29 @@ export default function NumberDetail() {
         <div className="card-head">
           <div>
             <h1 className="mono" style={{ fontFamily: "var(--mono)" }}>{n.phone_number}</h1>
-            <div style={{ marginTop: 6 }}>{numberPill(n)}</div>
-            {n.linked && <p className="helper">This number is linked to an agent inside Bolna, so it is never used for auto-switching.</p>}
+            <div style={{ marginTop: 6 }}>{numberPill(n)}<MissingNote n={n} /></div>
+            {n.linked_in_bolna && <p className="helper">Linked in Bolna to agent <span className="mono">{n.bolna_linked_agent_id}</span>, probably for inbound calls.</p>}
+            {n.missing_on_bolna && <p className="helper">Bolna no longer lists this number. It is skipped by auto-switching and cannot be assigned.</p>}
+            <label className="toggle">
+              <input type="checkbox" role="switch" checked={n.allow_auto_switch} disabled={busy}
+                onChange={() => setConfirmSwitch(true)} />
+              Allow auto-switching
+            </label>
+            <p className="helper">{n.allow_auto_switch
+              ? "Agents can be moved to this number automatically when their number reaches the limit."
+              : "This number is only used when you assign it by hand."}</p>
           </div>
           {n.status === "limit_reached" && <button className="btn btn-primary" onClick={reset}>Reset count</button>}
         </div>
       </section>
+
+      <ConfirmDialog open={confirmSwitch} busy={busy} confirmLabel={n.allow_auto_switch ? "Turn off" : "Allow auto-switching"}
+        title={n.allow_auto_switch ? "Turn off auto-switching?" : "Allow auto-switching?"}
+        onConfirm={() => setAutoSwitch(!n.allow_auto_switch)} onCancel={() => setConfirmSwitch(false)}>
+        <p>{n.allow_auto_switch
+          ? `${n.phone_number} will no longer be given to agents automatically. You can still assign it by hand.`
+          : `${n.phone_number} can be given to an agent automatically when another number reaches its limit.${n.linked_in_bolna ? " It is linked to an agent in Bolna, probably for inbound calls, so check that is what you want." : ""}`}</p>
+      </ConfirmDialog>
 
       <div className="cards4">
         <div className="stat"><div className="label">Connected calls</div><CountBar count={n.connected_count} threshold={n.threshold} /></div>

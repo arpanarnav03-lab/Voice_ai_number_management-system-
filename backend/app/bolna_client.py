@@ -21,6 +21,7 @@ class AgentNotFoundOnBolna(BolnaError):
 class BolnaClient(Protocol):
     async def get_me(self) -> dict: ...
     async def list_phone_numbers(self) -> list[dict]: ...
+    async def list_all_phone_numbers(self) -> list[dict]: ...
     async def place_call(self, agent_id: str, recipient: str, from_number: str,
                          user_data: dict | None = None) -> dict: ...
     async def get_execution(self, execution_id: str) -> dict: ...
@@ -73,6 +74,16 @@ class RealBolnaClient:
     async def list_phone_numbers(self) -> list[dict]:
         data = await self._get("/phone-numbers/all")
         return data if isinstance(data, list) else data.get("data", [])
+
+    async def list_all_phone_numbers(self) -> list[dict]:
+        """Every number on the account, for the sync. The endpoint is documented as one plain
+        array with no pagination; anything else is an error, never an empty list."""
+        data = await self._get("/phone-numbers/all")
+        if isinstance(data, dict) and isinstance(data.get("data"), list):
+            data = data["data"]
+        if not isinstance(data, list):
+            raise BolnaError("Bolna returned an unexpected response for the phone number list")
+        return data
 
     async def place_call(self, agent_id, recipient, from_number, user_data=None) -> dict:
         body: dict = {

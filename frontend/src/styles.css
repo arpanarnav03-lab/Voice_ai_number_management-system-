@@ -89,12 +89,14 @@ td .sub { display: block; color: var(--muted); font-size: 12.5px; }
 .pill-in_use, .pill-on_call { color: var(--use-fg); background: var(--use-bg); }
 .pill-limit { color: var(--warn-fg); background: var(--warn-bg); }
 .pill-error { color: var(--err-fg); background: var(--err-bg); border: 1px solid var(--err-border); }
+.pill-missing { color: var(--err-fg); background: var(--err-bg); border: 1px solid var(--err-border); }
 .pill-neutral { color: var(--neu-fg); background: var(--neu-bg); }
 .shape { width: 9px; height: 9px; flex: none; display: inline-block; }
 .shape-available { border: 2px solid currentColor; border-radius: 50%; }
 .shape-in_use { background: currentColor; border-radius: 50%; }
 .shape-limit { background: currentColor; }
 .shape-error { background: currentColor; clip-path: polygon(50% 0, 100% 100%, 0 100%); width: 10px; }
+.shape-missing { border: 2px solid currentColor; border-radius: 50%; }
 .shape-neutral { background: currentColor; transform: rotate(45deg) scale(.8); }
 .lock { flex: none; }
 
@@ -134,3 +136,17 @@ fieldset:disabled { opacity: .6; }
 @media (max-width: 560px) { main { padding: 12px; } .card { padding: 12px; } }
 @media (prefers-reduced-motion: no-preference) { .bar > span { transition: width .3s; } }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+/* sync */
+.head-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-bottom: 8px; }
+.head-row h2 { margin: 0; }
+.syncline { color: var(--muted); font-size: 14px; flex: 1 1 260px; }
+.skipnote { margin: 4px 0 12px; font-size: 13.5px; color: var(--muted); }
+.skipnote summary { cursor: pointer; min-height: 44px; display: flex; align-items: center; }
+.skipnote ul { margin: 0 0 8px; padding-left: 20px; font-family: var(--mono); font-size: 13px; }
+.linkbtn { background: none; border: 0; padding: 0 4px; min-height: 44px; color: var(--accent); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.pager { display: flex; align-items: center; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
+.dialog { max-width: 460px; width: calc(100% - 32px); border: 1px solid var(--border); border-radius: 8px; padding: 16px; color: var(--text); }
+.dialog::backdrop { background: rgba(21, 26, 33, .45); }
+.toggle { display: flex; align-items: center; gap: 10px; min-height: 44px; font-weight: 500; cursor: pointer; margin: 0; }
+.toggle input { width: 20px; height: 20px; accent-color: var(--accent); margin: 0; }

@@ -1,4 +1,4 @@
-import { createContext, ReactNode, useCallback, useContext, useState } from "react";
+import { createContext, ReactNode, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import type { AgentRow, CallRow, NumberRow } from "./api";
 import { fmtDuration, fmtTime } from "./api";
@@ -13,7 +13,7 @@ export function LockIcon({ label = "Locked until the call ends" }: { label?: str
   );
 }
 
-export type PillKind = "available" | "in_use" | "on_call" | "limit" | "error" | "neutral";
+export type PillKind = "available" | "in_use" | "on_call" | "limit" | "error" | "missing" | "neutral";
 
 /** Status pill. Colour is never the only signal: every kind has its own shape. */
 export function Pill({ kind, children }: { kind: PillKind; children: ReactNode }) {
@@ -31,16 +31,30 @@ export function agentPill(a: AgentRow) {
     case "near_limit": return <Pill kind="limit">Near limit</Pill>;
     case "on_call": return <Pill kind="on_call">On a call</Pill>;
     case "pool_empty": return <Pill kind="error">Pool empty</Pill>;
+    case "number_missing": return <Pill kind="error">Number missing on Bolna</Pill>;
     default: return <Pill kind="neutral">No number</Pill>;
   }
 }
 
 export function numberPill(n: NumberRow) {
+  if (n.status === "discovered") return <Pill kind="neutral">Discovered</Pill>;
+  if (n.status === "ignored") return <Pill kind="neutral">Ignored</Pill>;
   if (n.status === "limit_reached") return <Pill kind="limit">Limit reached</Pill>;
   if (n.status === "in_use") {
     return n.used_by?.on_call ? <Pill kind="on_call">In use, on a call</Pill> : <Pill kind="in_use">In use</Pill>;
   }
   return <Pill kind="available">Available</Pill>;
+}
+
+/** Red hollow-ring pill for a pool number that Bolna no longer lists. */
+export function MissingNote({ n }: { n: NumberRow }) {
+  if (!n.missing_on_bolna) return null;
+  return (
+    <>
+      <Pill kind="missing">Not on Bolna</Pill>
+      {n.missing_since && <span className="sub">since {fmtTime(n.missing_since)}</span>}
+    </>
+  );
 }
 
 export function resultPill(r: CallRow["result"]) {
@@ -53,6 +67,30 @@ export function resultPill(r: CallRow["result"]) {
     case "busy": return <Pill kind="neutral">Busy</Pill>;
     default: return <Pill kind="neutral">Failed</Pill>;
   }
+}
+
+/** Modal confirmation built on the native <dialog> (focus trap and Escape come for free). */
+export function ConfirmDialog({ open, title, children, confirmLabel, busy, onConfirm, onCancel }: {
+  open: boolean; title: string; children: ReactNode; confirmLabel: string; busy?: boolean;
+  onConfirm: () => void; onCancel: () => void;
+}) {
+  const ref = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    const d = ref.current;
+    if (!d) return;
+    if (open && !d.open) d.showModal();
+    if (!open && d.open) d.close();
+  }, [open]);
+  return (
+    <dialog ref={ref} className="dialog" aria-labelledby="dlg-title" onCancel={(e) => { e.preventDefault(); onCancel(); }}>
+      <h2 id="dlg-title">{title}</h2>
+      <div>{children}</div>
+      <div className="row" style={{ marginTop: 12, justifyContent: "flex-end" }}>
+        <button className="btn" onClick={onCancel}>Cancel</button>
+        <button className="btn btn-primary" disabled={busy} onClick={onConfirm}>{confirmLabel}</button>
+      </div>
+    </dialog>
+  );
 }
 
 export function CountBar({ count, threshold }: { count: number; threshold: number }) {

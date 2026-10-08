@@ -23,6 +23,8 @@ class Settings:
     call_timeout_minutes: float = 30.0
     unconfirmed_call_minutes: float = 2.0  # placed locally but Bolna never answered
     default_threshold: int = 5
+    sync_interval_minutes: float = 60.0  # 0 turns the scheduled sync (and the startup sync) off
+    sync_auto_approve: bool = False  # unlinked discovered numbers go straight to 'available'
     host: str = "127.0.0.1"
     port: int = 8000
     start_poller: bool = True
@@ -39,6 +41,8 @@ class Settings:
             bolna_mode=(os.getenv("BOLNA_MODE", "").strip().lower() or "fake"),
             min_connected_seconds=_f("MIN_CONNECTED_SECONDS", 1.0),
             call_timeout_minutes=_f("CALL_TIMEOUT_MINUTES", 30.0),
+            sync_interval_minutes=_f("SYNC_INTERVAL_MINUTES", 60.0),
+            sync_auto_approve=os.getenv("SYNC_AUTO_APPROVE", "").strip().lower() in ("1", "true", "yes", "on"),
             host=os.getenv("HOST", "").strip() or "127.0.0.1",
             port=int(_f("PORT", 8000)),
         )
@@ -48,5 +52,7 @@ class Settings:
     def validate(self) -> None:
         if self.bolna_mode not in ("fake", "real"):
             raise SystemExit("BOLNA_MODE must be 'fake' or 'real'")
+        if self.sync_interval_minutes < 0:
+            raise SystemExit("SYNC_INTERVAL_MINUTES must be 0 or more")
         if self.bolna_mode == "real" and not self.bolna_api_key:
             raise SystemExit("BOLNA_MODE=real needs BOLNA_API_KEY in .env")
