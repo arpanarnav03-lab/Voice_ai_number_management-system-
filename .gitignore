@@ -1,0 +1,12 @@
+.env
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+exports/
+__pycache__/
+*.pyc
+.pytest_cache/
+node_modules/
+frontend/dist/
+.venv/

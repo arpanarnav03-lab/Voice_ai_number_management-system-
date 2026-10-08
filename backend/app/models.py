@@ -1,0 +1,104 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from sqlalchemy import (
+    Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, String, text,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+def utcnow() -> datetime:
+    """Naive UTC (SQLite drops tzinfo anyway)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Setting(Base):
+    __tablename__ = "settings"
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(String(255))
+
+
+class Number(Base):
+    __tablename__ = "numbers"
+    __table_args__ = (
+        CheckConstraint("status IN ('available','in_use','limit_reached')", name="ck_number_status"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    phone_number: Mapped[str] = mapped_column(String(16), unique=True)
+    provider: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(16), default="available")
+    connected_count: Mapped[int] = mapped_column(Integer, default=0)
+    total_calls: Mapped[int] = mapped_column(Integer, default=0)
+    bolna_linked_agent_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    added_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class Agent(Base):
+    __tablename__ = "agents"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    bolna_agent_id: Mapped[str] = mapped_column(String(64), unique=True)
+    name: Mapped[str] = mapped_column(String(255))
+    # Invariant 1: a number belongs to at most one agent (UNIQUE), an agent has one number.
+    current_number_id: Mapped[int | None] = mapped_column(
+        ForeignKey("numbers.id"), unique=True, nullable=True
+    )
+    pending_switch: Mapped[bool] = mapped_column(Boolean, default=False)
+    pool_empty: Mapped[bool] = mapped_column(Boolean, default=False)
+    waiting_since: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    pool_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    current_number: Mapped[Number | None] = relationship(foreign_keys=[current_number_id])
+
+
+class Assignment(Base):
+    __tablename__ = "assignments"
+    __table_args__ = (
+        # Only one open assignment per number and per agent, enforced by the database.
+        Index("uq_open_assignment_number", "number_id", unique=True,
+              sqlite_where=text("ended_at IS NULL"), postgresql_where=text("ended_at IS NULL")),
+        Index("uq_open_assignment_agent", "agent_id", unique=True,
+              sqlite_where=text("ended_at IS NULL"), postgresql_where=text("ended_at IS NULL")),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id"))
+    number_id: Mapped[int] = mapped_column(ForeignKey("numbers.id"))
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # why it started: initial | manual | auto_threshold | auto_refill
+    reason: Mapped[str] = mapped_column(String(24))
+    # why it ended: manual | auto_threshold | released (NULL while open)
+    end_reason: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    connected_calls: Mapped[int] = mapped_column(Integer, default=0)
+
+    agent: Mapped[Agent] = relationship()
+    number: Mapped[Number] = relationship()
+
+
+class Call(Base):
+    __tablename__ = "calls"
+    __table_args__ = (
+        Index("ix_calls_agent_placed", "agent_id", "placed_at"),
+        Index("ix_calls_number_placed", "number_id", "placed_at"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # Invariant 4: an execution is counted at most once. NULL until Bolna accepts the call.
+    execution_id: Mapped[str | None] = mapped_column(String(80), unique=True, nullable=True)
+    agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id"))
+    number_id: Mapped[int] = mapped_column(ForeignKey("numbers.id"))
+    recipient: Mapped[str] = mapped_column(String(16))
+    placed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    status: Mapped[str] = mapped_column(String(32), default="placing")
+    duration: Mapped[float | None] = mapped_column(Float, nullable=True)
+    connected: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    reason: Mapped[str] = mapped_column(String(255), default="")
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    needs_review: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    agent: Mapped[Agent] = relationship()
+    number: Mapped[Number] = relationship()
