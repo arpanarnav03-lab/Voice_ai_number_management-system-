@@ -5,6 +5,7 @@ import AgentsTab from "./AgentsTab";
 import Login from "./Login";
 import NumberDetail from "./NumberDetail";
 import PoolTab from "./PoolTab";
+import SpamTab from "./SpamTab";
 import { api } from "./api";
 import { ToastProvider } from "./ui";
 
@@ -48,6 +49,7 @@ export default function App() {
             <nav aria-label="Main">
               <NavLink to="/" end>Agents</NavLink>
               <NavLink to="/pool">Number Pool</NavLink>
+              <NavLink to="/spam">Spam Check</NavLink>
             </nav>
             <span className="spacer" />
             {auth.mode === "fake"
@@ -60,6 +62,7 @@ export default function App() {
           <Routes>
             <Route path="/" element={<AgentsTab />} />
             <Route path="/pool" element={<PoolTab />} />
+            <Route path="/spam" element={<SpamTab />} />
             <Route path="/agents/:id" element={<AgentDetail />} />
             <Route path="/numbers/:id" element={<NumberDetail />} />
             <Route path="*" element={<section className="card"><p>Page not found.</p></section>} />

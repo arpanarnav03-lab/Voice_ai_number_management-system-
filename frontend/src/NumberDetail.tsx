@@ -1,12 +1,23 @@
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { ApiError, CallRow, NumberRow, api, fmtTime, useApi } from "./api";
-import { CallTable, ConfirmDialog, CountBar, Empty, MissingNote, REASON_TEXT, TableBox, numberPill, useToast } from "./ui";
+import { ApiError, CallRow, NumberEvent, NumberRow, api, fmtTime, useApi } from "./api";
+import { CallTable, ConfirmDialog, CountBar, Empty, MissingNote, REASON_TEXT, SpamBadge, TableBox, numberPill, useToast } from "./ui";
 
 type Detail = {
   number: NumberRow;
   agents: { agent_id: number; agent_name: string; started_at: string; ended_at: string | null; calls: number; connected_calls: number; reason: string }[];
   calls: CallRow[];
+  events: NumberEvent[];
+};
+
+const EVENT_TEXT: Record<string, string> = {
+  marked_spam: "Marked as spam",
+  marked_not_spam: "Marked as not spam",
+  test_call_placed: "Test call placed",
+  test_result: "Test result recorded",
+  release_started: "Release started",
+  release_succeeded: "Released from the pool and Bolna",
+  release_failed: "Release failed",
 };
 
 export default function NumberDetail() {
@@ -20,7 +31,8 @@ export default function NumberDetail() {
     return <section className="card"><p role="alert" className="field-err">{d.error.message}</p><Link to="/pool">Back to the pool</Link></section>;
   }
   if (!d.data) return <section className="card"><p className="muted">Loading...</p></section>;
-  const { number: n, agents, calls } = d.data;
+  const { number: n, agents, calls, events } = d.data;
+  const testCalls = calls.filter((c) => c.purpose === "test");
 
   async function reset() {
     try {
@@ -53,7 +65,7 @@ export default function NumberDetail() {
         <div className="card-head">
           <div>
             <h1 className="mono" style={{ fontFamily: "var(--mono)" }}>{n.phone_number}</h1>
-            <div style={{ marginTop: 6 }}>{numberPill(n)}<MissingNote n={n} /></div>
+            <div style={{ marginTop: 6 }}>{numberPill(n)} <SpamBadge n={n} /><MissingNote n={n} /></div>
             {n.linked_in_bolna && <p className="helper">Linked in Bolna to agent <span className="mono">{n.bolna_linked_agent_id}</span>, probably for inbound calls.</p>}
             {n.missing_on_bolna && <p className="helper">Bolna no longer lists this number. It is skipped by auto-switching and cannot be assigned.</p>}
             <label className="toggle">
@@ -83,6 +95,27 @@ export default function NumberDetail() {
         <div className="stat"><div className="label">Agents that used it</div><div className="value">{n.agents_served}</div></div>
         <div className="stat"><div className="label">Provider</div><div className="value" style={{ fontSize: 17 }}>{n.provider}</div></div>
       </div>
+
+      <section className="card" aria-labelledby="spam-h">
+        <h2 id="spam-h">Spam check</h2>
+        {n.spam_flag ? (
+          <p>Marked as spam on {fmtTime(n.spam_marked_at)}. {n.spam_note ? <>Note: {n.spam_note}</> : <span className="muted">No note.</span>} It stays in the pool but is never given to an agent.</p>
+        ) : <p className="muted">Not marked as spam.</p>}
+        <p className="helper">Last test call: {n.last_tested_at ? fmtTime(n.last_tested_at) : "never"}{n.last_test_result ? `, result: ${n.last_test_result === "ok" ? "OK" : "spam"}` : ""}.</p>
+        <h3 style={{ marginTop: 12 }}>Test calls</h3>
+        <CallTable calls={testCalls} showAgent />
+        <h3 style={{ marginTop: 12 }}>Event log</h3>
+        {!events.length ? <Empty>No events yet.</Empty> : (
+          <TableBox>
+            <table>
+              <thead><tr><th>When</th><th>Event</th><th>Detail</th></tr></thead>
+              <tbody>
+                {events.map((e) => <tr key={e.id}><td>{fmtTime(e.at)}</td><td>{EVENT_TEXT[e.event] ?? e.event}</td><td>{e.detail}</td></tr>)}
+              </tbody>
+            </table>
+          </TableBox>
+        )}
+      </section>
 
       <section className="card">
         <h2>Agents that used this number</h2>

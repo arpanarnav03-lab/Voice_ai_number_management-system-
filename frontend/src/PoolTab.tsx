@@ -2,9 +2,9 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { ApiError, NumberRow, PHONE_HINT, PHONE_RE, SyncStatus, api, timeAgo, useApi } from "./api";
 import DiscoveredList from "./DiscoveredList";
-import { CountBar, Empty, LockIcon, MissingNote, TableBox, numberPill, useToast } from "./ui";
+import { CountBar, Empty, LockIcon, MissingNote, SpamBadge, TableBox, numberPill, useToast } from "./ui";
 
-type Filter = "all" | "in_use" | "available" | "limit_reached" | "discovered";
+type Filter = "all" | "in_use" | "available" | "limit_reached" | "discovered" | "spam";
 
 export default function PoolTab() {
   const toast = useToast();
@@ -26,9 +26,11 @@ export default function PoolTab() {
 
   const sync = syncSt.data;
   const discoveredCount = sync?.discovered_count ?? 0;
-  const count = (f: Filter) =>
-    f === "discovered" ? discoveredCount : f === "all" ? items.length : items.filter((n) => n.status === f).length;
-  const shown = filter === "all" ? items : items.filter((n) => n.status === filter);
+  // a number marked as spam is never handed out, so it does not count as available
+  const matches = (n: NumberRow, f: Filter) =>
+    f === "all" ? true : f === "spam" ? n.spam_flag : f === "available" ? n.status === f && !n.spam_flag : n.status === f;
+  const count = (f: Filter) => (f === "discovered" ? discoveredCount : items.filter((n) => matches(n, f)).length);
+  const shown = items.filter((n) => matches(n, filter));
   const ok = sync?.last_success ?? null;
   const failed = sync?.last_run?.status === "failed" ? sync.last_run : null;
   const isSyncing = syncing || !!sync?.running;
@@ -88,7 +90,7 @@ export default function PoolTab() {
     }
   }
 
-  const chips: [Filter, string][] = [["all", "All"], ["in_use", "In use"], ["available", "Available"], ["limit_reached", "Limit reached"], ["discovered", "Discovered"]];
+  const chips: [Filter, string][] = [["all", "All"], ["in_use", "In use"], ["available", "Available"], ["limit_reached", "Limit reached"], ["discovered", "Discovered"], ["spam", "Spam"]];
 
   return (
     <>
@@ -167,8 +169,8 @@ export default function PoolTab() {
               <tbody>
                 {shown.map((n) => (
                   <tr key={n.id}>
-                    <td className="mono"><Link to={`/numbers/${n.id}`}>{n.phone_number}</Link>{n.linked_in_bolna && <span className="sub">Linked in Bolna</span>}</td>
-                    <td>{numberPill(n)}<MissingNote n={n} /></td>
+                    <td className="mono"><Link to={`/numbers/${n.id}`}>{n.phone_number}</Link>{n.linked_in_bolna && <span className="sub">Linked in Bolna</span>}{n.never_tested && !n.spam_flag && <span className="sub">Never tested</span>}</td>
+                    <td>{numberPill(n)} <SpamBadge n={n} /><MissingNote n={n} /></td>
                     <td>
                       {n.used_by ? <>{n.used_by.on_call && <LockIcon />} <Link to={`/agents/${n.used_by.id}`}>{n.used_by.name}</Link>
                         {n.used_by.pending_switch && <span className="sub">Switching after this call</span>}</> : <span className="muted">-</span>}

@@ -8,10 +8,10 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
-from . import auth, services, sync
+from . import auth, services, spam, sync
 from .bolna_client import AgentNotFoundOnBolna, BolnaError
 from .errors import AppError
-from .models import POOL_STATUSES, Agent, Assignment, Call, Number
+from .models import POOL_STATUSES, Agent, Assignment, Call, Number, NumberEvent
 from .validation import mask_phone
 
 log = logging.getLogger("bnm.api")
@@ -31,7 +31,7 @@ def _active_counts(s, agent_ids=None) -> dict[int, int]:
 
 
 def _last_used(s) -> dict[int, object]:
-    q = select(Call.agent_id, func.max(Call.placed_at)).group_by(Call.agent_id)
+    q = select(Call.agent_id, func.max(Call.placed_at)).where(Call.purpose == "lead").group_by(Call.agent_id)
     return {a: t for a, t in s.execute(q)}
 
 
@@ -41,7 +41,9 @@ def agent_rows(s, agents: list[Agent], threshold: int) -> list[dict]:
     for a in agents:
         n = a.current_number
         ac = active.get(a.id, 0)
-        if ac > 0:
+        if a.pending_switch and a.pending_switch_reason == "spam":
+            status = "switching_spam"
+        elif ac > 0:
             status = "on_call"
         elif n is not None and n.missing_on_bolna:
             status = "number_missing"
@@ -58,9 +60,10 @@ def agent_rows(s, agents: list[Agent], threshold: int) -> list[dict]:
             "number": None if n is None else {
                 "id": n.id, "phone_number": n.phone_number, "status": n.status,
                 "connected_count": n.connected_count, "provider": n.provider,
-                "missing_on_bolna": n.missing_on_bolna},
+                "missing_on_bolna": n.missing_on_bolna, "spam_flag": n.spam_flag},
             "status": status, "on_call": ac > 0, "active_calls": ac,
-            "pending_switch": a.pending_switch, "last_used": iso(last.get(a.id)),
+            "pending_switch": a.pending_switch, "pending_switch_reason": a.pending_switch_reason,
+            "last_used": iso(last.get(a.id)),
         })
     return rows
 
@@ -81,9 +84,13 @@ def number_rows(s, numbers: list[Number], threshold: int) -> list[dict]:
             "linked_in_bolna": n.linked_in_bolna, "bolna_linked_agent_id": n.bolna_linked_agent_id,
             "allow_auto_switch": n.allow_auto_switch, "missing_on_bolna": n.missing_on_bolna,
             "missing_since": iso(n.missing_since), "discovered_at": iso(n.discovered_at),
+            "spam_flag": n.spam_flag, "spam_marked_at": iso(n.spam_marked_at), "spam_note": n.spam_note,
+            "never_tested": n.last_tested_at is None and n.last_test_result is None,
+            "last_tested_at": iso(n.last_tested_at), "last_test_result": n.last_test_result,
+            "bolna_rented": n.bolna_rented, "has_bolna_id": bool(n.bolna_phone_number_id),
             "used_by": None if h is None else {
                 "id": h.id, "name": h.name, "on_call": active.get(h.id, 0) > 0,
-                "pending_switch": h.pending_switch},
+                "pending_switch": h.pending_switch, "pending_switch_reason": h.pending_switch_reason},
         })
     return rows
 
@@ -96,7 +103,7 @@ def call_rows(s, calls: list[Call]) -> list[dict]:
         "number_id": c.number_id, "phone_number": phones.get(c.number_id, "?"),
         "recipient": mask_phone(c.recipient), "placed_at": iso(c.placed_at),
         "status": c.status, "duration": c.duration, "result": services.result_of(c),
-        "reason": c.reason, "needs_review": c.needs_review,
+        "reason": c.reason, "needs_review": c.needs_review, "purpose": c.purpose,
     } for c in calls]
 
 
@@ -234,7 +241,8 @@ def number_detail(number_id: int, request: Request):
         agents = []
         for a in assigns:
             q = select(func.count()).select_from(Call).where(
-                Call.agent_id == a.agent_id, Call.number_id == n.id, Call.placed_at >= a.started_at)
+                Call.agent_id == a.agent_id, Call.number_id == n.id, Call.placed_at >= a.started_at,
+                Call.purpose == "lead")
             if a.ended_at:
                 q = q.where(Call.placed_at <= a.ended_at)
             agents.append({
@@ -244,7 +252,10 @@ def number_detail(number_id: int, request: Request):
             })
         calls = s.scalars(select(Call).where(Call.number_id == n.id)
                           .order_by(Call.placed_at.desc()).limit(200)).all()
-        return {"number": number_rows(s, [n], th)[0], "agents": agents, "calls": call_rows(s, calls)}
+        events = s.scalars(select(NumberEvent).where(NumberEvent.number_id == n.id)
+                           .order_by(NumberEvent.at.desc(), NumberEvent.id.desc()).limit(100)).all()
+        return {"number": number_rows(s, [n], th)[0], "agents": agents, "calls": call_rows(s, calls),
+                "events": [{"id": e.id, "event": e.event, "detail": e.detail, "at": iso(e.at)} for e in events]}
 
 
 class ApproveBody(BaseModel):
@@ -327,6 +338,183 @@ def sync_status(request: Request):
     return sync.status(request.app.state.db)
 
 
+# ------------------------------------------------------------------ spam check
+class MarkSpamBody(BaseModel):
+    note: str | None = Field(default=None, max_length=500)
+
+
+class SpamResultBody(BaseModel):
+    result: str
+    note: str | None = Field(default=None, max_length=500)
+
+
+class TestRunBody(BaseModel):
+    number_ids: list[int] = Field(max_length=200)
+    test_agent_id: int | None = None  # an agent already in the app ...
+    bolna_agent_id: str | None = None  # ... or a Bolna agent ID that is pasted in
+    reviewer_phone: str
+
+
+class ReleaseBody(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=200)
+
+
+@protected.post("/numbers/{number_id}/mark-spam")
+def mark_spam(number_id: int, request: Request, body: MarkSpamBody | None = None):
+    with request.app.state.db.session() as s:
+        n = services.mark_spam(s, number_id, body.note if body else None)
+        return number_rows(s, [n], services.get_threshold(s))[0]
+
+
+@protected.post("/numbers/{number_id}/not-spam")
+def not_spam(number_id: int, request: Request):
+    with request.app.state.db.session() as s:
+        n = services.mark_not_spam(s, number_id)
+        return number_rows(s, [n], services.get_threshold(s))[0]
+
+
+@protected.post("/numbers/{number_id}/spam-result")
+def spam_result(number_id: int, body: SpamResultBody, request: Request):
+    with request.app.state.db.session() as s:
+        n = services.record_test_result(s, number_id, body.result, body.note)
+        return number_rows(s, [n], services.get_threshold(s))[0]
+
+
+@protected.post("/spam/tests", status_code=201)
+async def create_test_run(body: TestRunBody, request: Request):
+    from .validation import validate_phone
+    st = request.app.state
+    reviewer = validate_phone(body.reviewer_phone)  # reject bad input before calling Bolna
+    bolna_id = (body.bolna_agent_id or "").strip()
+    if body.test_agent_id is None and not bolna_id:
+        raise AppError("VALIDATION_ERROR", "Invalid input: test_agent_id", 422)
+
+    def known_agent():
+        with st.db.session() as s:
+            if body.test_agent_id is not None:
+                a = s.get(Agent, body.test_agent_id)
+            else:
+                a = s.scalar(select(Agent).where(Agent.bolna_agent_id == bolna_id))
+            return a.id if a else None
+
+    agent_id = await run_in_threadpool(known_agent)
+    name = None
+    if agent_id is None:
+        if body.test_agent_id is not None:
+            raise AppError("AGENT_NOT_FOUND", "Agent not found", 404)
+        try:  # a pasted ID the app does not know yet: check it with Bolna first
+            name = ((await st.bolna.get_agent(bolna_id)) or {}).get("name")
+        except AgentNotFoundOnBolna:
+            raise AppError("AGENT_NOT_FOUND", "Bolna does not know this agent ID. Check it and try again.", 404)
+        except BolnaError as e:
+            raise AppError("BOLNA_ERROR", f"Bolna: {e.message}", 502)
+
+    def work():
+        with st.db.session() as s:
+            agent = s.get(Agent, agent_id) if agent_id is not None else None
+            if agent is None:  # new agent row with no number; it only makes the test calls
+                agent = Agent(bolna_agent_id=bolna_id, name=name or f"Agent {bolna_id[:8]}")
+                s.add(agent)
+                s.flush()
+            return spam.create_run(s, body.number_ids, agent, reviewer, st.settings.spam_test_max_per_run,
+                                   st.settings.test_result_expiry_hours)
+    return await run_in_threadpool(work)
+
+
+@protected.get("/spam/tests/{run_id}")
+def get_test_run(run_id: int, request: Request):
+    with request.app.state.db.session() as s:
+        return spam.run_progress(s, run_id)
+
+
+@protected.get("/spam/stack")
+def spam_stack(request: Request):
+    """The test stack, top first: every pool number that is not marked as spam."""
+    st = request.app.state
+    with st.db.session() as s:
+        th = services.get_threshold(s)
+        nums = services.stack_numbers(s)
+        blockers = services.stack_blockers(s, nums, st.settings.test_result_expiry_hours)
+        queue = spam.queue_state(s)
+        rows = number_rows(s, nums, th)
+        nxt = services.next_testable(nums, blockers)  # the same check the select route uses
+        never = 0
+        for i, (r, n) in enumerate(zip(rows, nums), start=1):
+            b = blockers.get(n.id)
+            r["position"] = i
+            r["awaiting_result"] = services.is_awaiting(n, st.settings.test_result_expiry_hours)
+            r["eligible"] = b is None
+            r["is_next"] = nxt is not None and n.id == nxt.id
+            r["reason"] = {"code": b[0], "message": b[1]} if b else None
+            r["test"] = queue.get(n.id)
+            r["never_tested"] = n.last_tested_at is None and n.last_test_result is None
+            never += r["never_tested"]
+        return {"threshold": th, "items": rows, "total": len(rows), "never_tested": never}
+
+
+@protected.get("/spam/stack/health")
+def spam_stack_health(request: Request):
+    """Zeros when the stack holds exactly the non-spam pool numbers with unique positions."""
+    with request.app.state.db.session() as s:
+        return services.stack_health(s)
+
+
+@protected.post("/spam/stack/reconcile")
+def spam_stack_reconcile(request: Request):
+    with request.app.state.db.session() as s:
+        return services.reconcile_stack(s)
+
+
+@protected.post("/spam/stack/select")
+def spam_stack_select(request: Request, body: dict | None = None):
+    """Suggest the one number to test next: the first testable number from the top. Places no call and
+    reserves nothing. At most one id is returned (still a list); any `count` in the body is ignored."""
+    st = request.app.state
+    with st.db.session() as s:
+        return services.select_next(s, st.settings.test_result_expiry_hours)
+
+
+@protected.post("/numbers/{number_id}/clear-test")
+def clear_test(number_id: int, request: Request):
+    with request.app.state.db.session() as s:
+        n = services.clear_test(s, number_id)
+        return number_rows(s, [n], services.get_threshold(s))[0]
+
+
+@protected.get("/spam/list")
+def spam_list(request: Request):
+    with request.app.state.db.session() as s:
+        th = services.get_threshold(s)
+        nums = s.scalars(select(Number).where(Number.spam_flag.is_(True), Number.status != "released")
+                         .order_by(Number.spam_marked_at, Number.id)).all()
+        rows = number_rows(s, nums, th)
+        for r, n in zip(rows, nums):
+            b = spam.release_blocker(s, n)
+            r["release_blocker"] = {"code": b[0], "message": b[1]} if b else None
+        released = s.scalar(select(func.count()).select_from(Number).where(Number.status == "released")) or 0
+        return {"items": rows, "released_count": released,
+                "delete_enabled": request.app.state.settings.allow_bolna_number_delete}
+
+
+@protected.get("/spam/released")
+def spam_released(request: Request):
+    with request.app.state.db.session() as s:
+        th = services.get_threshold(s)
+        nums = s.scalars(select(Number).where(Number.status == "released").order_by(Number.id.desc())).all()
+        when = {nid: at for nid, at in s.execute(
+            select(NumberEvent.number_id, func.max(NumberEvent.at))
+            .where(NumberEvent.event == "release_succeeded").group_by(NumberEvent.number_id))}
+        rows = number_rows(s, nums, th)
+        for r in rows:
+            r["released_at"] = iso(when.get(r["id"]))
+        return {"items": rows}
+
+
+@protected.post("/spam/release")
+async def spam_release(body: ReleaseBody, request: Request):
+    return {"results": await spam.release_numbers(request.app.state, body.ids)}
+
+
 # ------------------------------------------------------------------ agents
 class AssignBody(BaseModel):
     bolna_agent_id: str
@@ -377,9 +565,10 @@ def agent_detail(agent_id: int, request: Request):
                             .order_by(Assignment.started_at.desc(), Assignment.id.desc())).all()
         calls = s.scalars(select(Call).where(Call.agent_id == a.id)
                           .order_by(Call.placed_at.desc()).limit(200)).all()
-        placed = s.scalar(select(func.count()).select_from(Call).where(Call.agent_id == a.id)) or 0
+        placed = s.scalar(select(func.count()).select_from(Call).where(
+            Call.agent_id == a.id, Call.purpose == "lead")) or 0
         connected = s.scalar(select(func.count()).select_from(Call).where(
-            Call.agent_id == a.id, Call.connected.is_(True))) or 0
+            Call.agent_id == a.id, Call.connected.is_(True), Call.purpose == "lead")) or 0
         return {
             "agent": agent_rows(s, [a], th)[0], "threshold": th,
             "summary": {"calls_placed": placed, "connected_calls": connected,

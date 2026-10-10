@@ -13,7 +13,7 @@ class Harness:
     def __init__(self, tmp_path, password=""):
         self.settings = Settings(
             database_url=f"sqlite:///{tmp_path}/test.db", run_migrations=False,
-            start_poller=False, app_password=password,
+            start_poller=False, app_password=password, spam_test_delay_seconds=0.0,
         )
         self.bolna = FakeBolnaClient()
         self.app = create_app(self.settings, self.bolna)

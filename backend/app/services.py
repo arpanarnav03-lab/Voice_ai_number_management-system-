@@ -4,13 +4,20 @@ are serialised; on Postgres the agent / number rows are locked with SELECT ... F
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 
 from sqlalchemy import exists, func, select
 from sqlalchemy.orm import Session
 
 from .connected import classify
 from .errors import AppError
-from .models import POOL_STATUSES, Agent, Assignment, Call, Number, Setting, utcnow
+from .stack import (  # noqa: F401  (re-exported for callers)
+    in_stack, reconcile_number_in_stack, reconcile_stack, stack_bottom, stack_health, stack_leave, stack_top,
+    stack_top_many,
+)
+from .models import (
+    POOL_STATUSES, Agent, Assignment, Call, Number, NumberEvent, Setting, SpamTestItem, SpamTestRun, utcnow,
+)
 from .validation import mask_phone, validate_phone
 
 DEFAULT_THRESHOLD = 5
@@ -40,6 +47,7 @@ def set_threshold(s: Session, value) -> int:
     for num in s.scalars(select(Number).where(Number.status == "available")):
         if num.connected_count >= n:
             num.status = "limit_reached"
+            reconcile_number_in_stack(s, num)
     s.flush()
     return n
 
@@ -49,6 +57,18 @@ def active_call_count(s: Session, agent_id: int) -> int:
     return s.scalar(
         select(func.count()).select_from(Call).where(Call.agent_id == agent_id, Call.settled_at.is_(None))
     ) or 0
+
+
+def number_active_calls(s: Session, number_id: int) -> int:
+    """Calls (lead or test) still in progress from this number."""
+    return s.scalar(
+        select(func.count()).select_from(Call).where(Call.number_id == number_id, Call.settled_at.is_(None))
+    ) or 0
+
+
+def add_event(s: Session, number_id: int, event: str, detail: str = "") -> None:
+    """Audit trail for a number. `detail` must never hold a full phone number."""
+    s.add(NumberEvent(number_id=number_id, event=event, detail=detail[:500]))
 
 
 def holder_of(s: Session, number_id: int) -> Agent | None:
@@ -87,6 +107,8 @@ def _check_assignable(s: Session, number: Number, threshold: int) -> None:
     """Invariant: a number can be picked only if it is free AND under the limit."""
     if number.missing_on_bolna:
         raise _missing_error(number)
+    if number.spam_flag:
+        raise AppError("NUMBER_MARKED_SPAM", f"{number.phone_number} is marked as spam.", 409)
     holder = holder_of(s, number.id)
     if holder is not None:
         on_call = active_call_count(s, holder.id) > 0
@@ -108,8 +130,10 @@ def _assign(s: Session, agent: Agent, number: Number, reason: str) -> None:
     agent.current_number_id = number.id
     agent.pool_empty = False
     agent.pending_switch = False
+    agent.pending_switch_reason = None
     agent.waiting_since = None
     number.status = "in_use"
+    reconcile_number_in_stack(s, number)  # still a member: assignment never changes membership
     s.add(Assignment(agent_id=agent.id, number_id=number.id, reason=reason, started_at=utcnow()))
     s.flush()
     s.expire(agent, ["current_number"])
@@ -127,6 +151,7 @@ def _release(s: Session, agent: Agent, end_reason: str, threshold: int) -> Numbe
         a.end_reason = end_reason
     number.status = "limit_reached" if (
         number.status == "limit_reached" or number.connected_count >= threshold) else "available"
+    reconcile_number_in_stack(s, number)  # released back to the pool: still a member
     agent.current_number_id = None
     s.flush()
     s.expire(agent, ["current_number"])
@@ -135,12 +160,13 @@ def _release(s: Session, agent: Agent, end_reason: str, threshold: int) -> Numbe
 
 def pick_available(s: Session, provider: str | None, threshold: int) -> Number | None:
     """First available number (pool order = date added) of the same provider that may be
-    auto-switched to: approved (status 'available'), allow_auto_switch, and still on Bolna."""
+    auto-switched to: approved (status 'available'), allow_auto_switch, still on Bolna and not marked as spam."""
     q = select(Number).where(
         Number.status == "available",
         Number.connected_count < threshold,
         Number.allow_auto_switch.is_(True),
         Number.missing_on_bolna.is_(False),
+        Number.spam_flag.is_(False),
         ~exists().where(Agent.current_number_id == Number.id),
     )
     if provider:
@@ -176,6 +202,8 @@ def add_number(s: Session, phone: str, bolna_numbers: list[dict]) -> tuple[Numbe
     existing = s.scalar(select(Number).where(Number.phone_number == phone).with_for_update())
     if existing is not None and existing.status in POOL_STATUSES:
         raise AppError("NUMBER_ALREADY_IN_POOL", f"{phone} is already in the pool.", 409)
+    if existing is not None and existing.status in ("releasing", "released"):
+        raise AppError("NUMBER_RELEASED", f"{phone} was released and cannot be added again.", 409)
     linked = match.get("agent_id") or None
     provider = str(match.get("telephony_provider") or "unknown").lower()
     if existing is not None:  # discovered / ignored: typing it in by hand counts as approval
@@ -186,13 +214,18 @@ def add_number(s: Session, phone: str, bolna_numbers: list[dict]) -> tuple[Numbe
         num.bolna_linked_agent_id = str(linked) if linked else None
         num.allow_auto_switch = not linked
         num.missing_on_bolna, num.missing_since = False, None
+        num.bolna_phone_number_id = str(match["id"])[:64] if match.get("id") else num.bolna_phone_number_id
+        num.bolna_rented = match["rented"] if isinstance(match.get("rented"), bool) else num.bolna_rented
     else:
         num = Number(
             phone_number=phone, provider=provider, status="available",
             linked_in_bolna=linked is not None, allow_auto_switch=not linked,
             bolna_linked_agent_id=str(linked) if linked else None,
+            bolna_phone_number_id=str(match["id"])[:64] if match.get("id") else None,
+            bolna_rented=match["rented"] if isinstance(match.get("rented"), bool) else None,
         )
         s.add(num)
+    stack_top(s, num)
     s.flush()
     warning = None
     if linked:
@@ -207,6 +240,7 @@ def _approve(num: Number) -> None:
     num.status = "available"
     num.connected_count = 0
     num.added_at = utcnow()  # pool order is the date added to the pool
+    # (the caller puts it on top of the test stack)
 
 
 def approve_number(s: Session, number_id: int, confirm_linked: bool = False) -> Number:
@@ -214,13 +248,16 @@ def approve_number(s: Session, number_id: int, confirm_linked: bool = False) -> 
     if num.status in POOL_STATUSES:
         raise AppError("NUMBER_ALREADY_IN_POOL", f"{num.phone_number} is already in the pool.", 409)
     if num.status != "discovered":
-        raise AppError("NUMBER_NOT_DISCOVERED", f"{num.phone_number} is ignored. Restore it first.", 409)
+        raise AppError("NUMBER_NOT_DISCOVERED", f"{num.phone_number} is not in the discovered list.", 409)
+    if num.spam_flag:
+        raise AppError("NUMBER_MARKED_SPAM", f"{num.phone_number} is marked as spam.", 409)
     if num.linked_in_bolna and not confirm_linked:
         raise AppError(
             "NUMBER_LINKED_IN_BOLNA",
             f"{num.phone_number} is linked to an agent in Bolna (probably for inbound calls).",
             409, linked_agent_id=num.bolna_linked_agent_id)
     _approve(num)
+    stack_top(s, num)
     s.flush()
     fill_waiting(s)
     return num
@@ -233,13 +270,15 @@ def approve_many(s: Session, ids: list[int] | None, all_unlinked: bool, confirm_
         q = q.where(Number.linked_in_bolna.is_(False))
     else:
         q = q.where(Number.id.in_(ids or []))
-    approved, skipped_linked = 0, []
-    for num in s.scalars(q.with_for_update()):
+    approved, skipped_linked, done = 0, [], []
+    for num in s.scalars(q.where(Number.spam_flag.is_(False)).with_for_update()):
         if num.linked_in_bolna and not confirm_linked:
             skipped_linked.append(num.id)
             continue
         _approve(num)
+        done.append(num)
         approved += 1
+    stack_top_many(s, done)
     s.flush()
     if approved:
         fill_waiting(s)
@@ -251,6 +290,7 @@ def ignore_number(s: Session, number_id: int) -> Number:
     if num.status != "discovered":
         raise AppError("NUMBER_NOT_DISCOVERED", f"{num.phone_number} is not in the discovered list.", 409)
     num.status = "ignored"
+    reconcile_number_in_stack(s, num)
     s.flush()
     return num
 
@@ -259,6 +299,7 @@ def ignore_many(s: Session, ids: list[int]) -> int:
     count = 0
     for num in s.scalars(select(Number).where(Number.status == "discovered", Number.id.in_(ids))):
         num.status = "ignored"
+        reconcile_number_in_stack(s, num)
         count += 1
     s.flush()
     return count
@@ -269,6 +310,7 @@ def restore_number(s: Session, number_id: int) -> Number:
     if num.status != "ignored":
         raise AppError("NUMBER_NOT_IGNORED", f"{num.phone_number} is not ignored.", 409)
     num.status = "discovered"
+    reconcile_number_in_stack(s, num)
     s.flush()
     return num
 
@@ -288,9 +330,12 @@ def reset_number(s: Session, number_id: int) -> Number:
     holder = holder_of(s, num.id)
     if holder is not None:
         num.status = "in_use"
-        holder.pending_switch = False  # the limit no longer applies
+        if holder.pending_switch_reason != "spam":
+            holder.pending_switch = False  # the limit no longer applies
+            holder.pending_switch_reason = None
     else:
         num.status = "available"
+    reconcile_number_in_stack(s, num)
     s.flush()
     fill_waiting(s)
     return num
@@ -356,6 +401,10 @@ def begin_call(s: Session, agent_id: int, recipient: str) -> CallPlan:
         raise AppError("AGENT_HAS_NO_NUMBER", f"{agent.name} has no number assigned.", 409)
     if agent.current_number is not None and agent.current_number.missing_on_bolna:
         raise _missing_error(agent.current_number)  # blocked, but never switched automatically
+    if agent.pending_switch and agent.pending_switch_reason == "spam":
+        raise AppError("AGENT_SWITCHING",
+                       f"{agent.name}'s number was marked as spam and will be swapped when its current "
+                       "calls end. New calls are blocked until then.", 409)
     if agent.pending_switch:
         raise AppError("SWITCH_PENDING",
                        f"{agent.name}'s number reached its limit and will switch when the current call ends.", 409)
@@ -380,37 +429,54 @@ def abort_call(s: Session, call_id: int) -> None:
     if call is None or call.settled_at is not None:
         return
     number = s.get(Number, call.number_id)
-    if number is not None and number.total_calls > 0:
+    if call.purpose == "lead" and number is not None and number.total_calls > 0:
         number.total_calls -= 1
+    agent_id = call.agent_id
     s.delete(call)
     s.flush()
+    agent = s.get(Agent, agent_id)
+    if agent is not None and agent.pending_switch and agent.pending_switch_reason == "spam":
+        # this may have been the last active call a spam swap was waiting for
+        _after_settle(s, lock_agent(s, agent_id), get_threshold(s))
 
 
 def _after_settle(s: Session, agent: Agent, threshold: int) -> None:
-    """Threshold check + switch (or pending switch) once a call has ended."""
+    """Threshold / spam check + switch (or pending switch) once a call has ended."""
     active = active_call_count(s, agent.id)
     num = agent.current_number
+    if num is not None and num.spam_flag:
+        # a flagged number is never kept in service: swap once the agent is idle
+        if active > 0:
+            agent.pending_switch = True
+            agent.pending_switch_reason = "spam"
+        else:
+            _switch(s, agent, threshold, "auto_spam")
+        return
     if num is not None and num.connected_count >= threshold:
         num.status = "limit_reached"
+        reconcile_number_in_stack(s, num)
     if num is not None and num.status == "limit_reached":
         if active > 0:
             agent.pending_switch = True  # never change a number mid-call
+            agent.pending_switch_reason = "limit"
         else:
             _switch(s, agent, threshold)
     elif agent.pending_switch and active == 0:
         agent.pending_switch = False
+        agent.pending_switch_reason = None
 
 
-def _switch(s: Session, agent: Agent, threshold: int) -> None:
+def _switch(s: Session, agent: Agent, threshold: int, reason: str = "auto_threshold") -> None:
     old = agent.current_number
     provider = old.provider if old is not None else agent.pool_provider
-    _release(s, agent, "auto_threshold", threshold)
+    _release(s, agent, reason, threshold)
     new = pick_available(s, provider, threshold)
     if new is not None:
-        _assign(s, agent, new, "auto_threshold")
+        _assign(s, agent, new, reason)
     else:
         agent.pool_empty = True
         agent.pending_switch = False
+        agent.pending_switch_reason = None
         agent.waiting_since = utcnow()
         agent.pool_provider = provider
         s.flush()
@@ -437,7 +503,14 @@ def settle_call(s: Session, call_id: int, execution: dict, min_seconds: float = 
     if connected is None:
         call.needs_review = True  # 'unclear': shown in the UI, never counted
     s.flush()
-    if connected:
+    if call.purpose == "test":
+        # a test call is only a look at how the number appears: it never moves a counter
+        n = s.get(Number, call.number_id)
+        if n is not None:
+            n.last_tested_at = utcnow()
+            n.test_awaiting_since = utcnow()  # a person must now say OK or spam
+        s.flush()
+    elif connected:
         number = s.get(Number, call.number_id)
         number.connected_count += 1
         a = s.scalar(select(Assignment).where(
@@ -461,6 +534,11 @@ def mark_unknown(s: Session, call_id: int, why: str) -> bool:
     call.reason = why
     call.needs_review = True
     call.settled_at = utcnow()
+    if call.purpose == "test":
+        n = s.get(Number, call.number_id)
+        if n is not None:
+            n.last_tested_at = utcnow()
+            n.test_awaiting_since = utcnow()
     s.flush()
     _after_settle(s, agent, get_threshold(s))
     return True
@@ -485,3 +563,157 @@ def result_of(call: Call) -> str:
 
 def log_ref(call: Call) -> str:
     return f"call#{call.id} to {mask_phone(call.recipient)}"
+
+
+# ---------------------------------------------------------------- test stack
+# An ordered list of the pool's numbers (ascending stack_order = top first). Numbers join at the
+# top, rotate to the bottom after Mark OK, and leave when marked as spam. Positions are computed
+# inside the caller's transaction (SQLite serialises writers; ties break by id).
+def is_awaiting(num: Number, expiry_hours: float) -> bool:
+    """A test call ended and nobody has marked the number yet (and it has not expired)."""
+    since = num.test_awaiting_since
+    return since is not None and utcnow() - since < timedelta(hours=expiry_hours)
+
+
+def stack_blockers(s: Session, numbers: list[Number], expiry_hours: float) -> dict[int, tuple[str, str]]:
+    """Why a number cannot be tested right now: number id -> (code, short reason)."""
+    ids = [n.id for n in numbers]
+    busy = set(s.scalars(select(Call.number_id).where(Call.number_id.in_(ids), Call.settled_at.is_(None))))
+    reserved = {nid: st for nid, st in s.execute(
+        select(SpamTestItem.number_id, SpamTestItem.status).join(SpamTestRun, SpamTestRun.id == SpamTestItem.run_id)
+        .where(SpamTestItem.number_id.in_(ids), SpamTestItem.status.in_(("queued", "calling")),
+               SpamTestRun.status == "running"))}
+    out: dict[int, tuple[str, str]] = {}
+    for n in numbers:
+        if n.id in busy:
+            out[n.id] = ("NUMBER_BUSY", "On a call")
+        elif n.id in reserved:
+            out[n.id] = ("NUMBER_IN_TEST", "Calling" if reserved[n.id] == "calling" else "Queued")
+        elif is_awaiting(n, expiry_hours):
+            out[n.id] = ("AWAITING_RESULT", "Awaiting result")
+        elif n.missing_on_bolna:
+            out[n.id] = ("NUMBER_MISSING_ON_BOLNA", "Not on Bolna")
+    return out
+
+
+def stack_numbers(s: Session) -> list[Number]:
+    """The whole stack, top first. A number without a position yet counts as new, so it is on top."""
+    return list(s.scalars(select(Number).where(Number.status.in_(POOL_STATUSES), Number.spam_flag.is_(False))
+                          .order_by(Number.stack_order.is_(None).desc(), Number.stack_order, Number.id)))
+
+
+def next_testable(nums: list[Number], blockers: dict[int, tuple[str, str]]) -> Number | None:
+    """The first number from the top of the stack that can be tested right now. Auto-select ticks this
+    one and the stack list tags it "Next", so the two can never disagree."""
+    return next((n for n in nums if n.id not in blockers), None)
+
+
+def select_next(s: Session, expiry_hours: float) -> dict:
+    """Suggest the one number to test next. Reserves nothing, changes nothing."""
+    nums = stack_numbers(s)
+    blockers = stack_blockers(s, nums, expiry_hours)
+    pick = next_testable(nums, blockers)
+    skipped = []
+    for n in nums:  # the numbers above it that cannot be tested right now, and why
+        if pick is not None and n.id == pick.id:
+            break
+        skipped.append({"number_id": n.id, "code": blockers[n.id][0], "message": blockers[n.id][1]})
+    return {"ids": [pick.id] if pick else [], "skipped": skipped}
+
+
+def clear_test(s: Session, number_id: int) -> Number:
+    """Dismiss an awaiting result without marking anything. The number keeps its position."""
+    num = _get_number(s, number_id)
+    num.test_awaiting_since = None
+    s.flush()
+    return num
+
+
+# ---------------------------------------------------------------- spam check
+def begin_test_call(s: Session, agent_id: int, number_id: int, reviewer_phone: str) -> CallPlan:
+    """Register a test call from `number_id` made by the test agent. It is an active call for
+    that agent (the call lock applies) but never touches connected_count or total_calls."""
+    reviewer_phone = validate_phone(reviewer_phone)
+    agent = lock_agent(s, agent_id)
+    if agent.pending_switch and agent.pending_switch_reason == "spam":
+        raise AppError("AGENT_SWITCHING", f"{agent.name} is waiting to swap a spam number.", 409)
+    number = _get_number(s, number_id)
+    if number_active_calls(s, number.id) > 0:
+        raise AppError("NUMBER_BUSY", f"{number.phone_number} has a call in progress right now.", 409)
+    call = Call(agent_id=agent.id, number_id=number.id, recipient=reviewer_phone, status="placing",
+                purpose="test")
+    s.add(call)
+    s.flush()
+    add_event(s, number.id, "test_call_placed", f"test call #{call.id} placed")
+    return CallPlan(call.id, agent.bolna_agent_id, number.phone_number, reviewer_phone)
+
+
+def mark_spam(s: Session, number_id: int, note: str | None = None) -> Number:
+    """A person flags a number. It stays in the pool but is never allocated again. An agent that
+    holds it is swapped at once if idle, otherwise as soon as its last call ends."""
+    holder = holder_of(s, number_id)
+    if holder is not None:
+        lock_agent(s, holder.id)  # same lock order as begin_call: agent first, then number
+    num = _get_number(s, number_id)
+    note = (note or "").strip()[:500] or None
+    if num.spam_flag:
+        if note:
+            num.spam_note = note
+        s.flush()
+        return num
+    num.spam_flag = True
+    num.spam_marked_at = utcnow()
+    num.spam_note = note
+    num.test_awaiting_since = None
+    stack_leave(num)  # it now lives in the spam list
+    add_event(s, num.id, "marked_spam", "marked as spam" + (" with a note" if note else ""))
+    s.flush()
+    holder = holder_of(s, num.id)
+    if holder is not None:
+        # check-and-swap in ONE transaction: a call cannot start between the two
+        if active_call_count(s, holder.id) > 0:
+            holder.pending_switch = True
+            holder.pending_switch_reason = "spam"
+        else:
+            _switch(s, holder, get_threshold(s), "auto_spam")
+    s.flush()
+    return num
+
+
+def mark_not_spam(s: Session, number_id: int) -> Number:
+    holder = holder_of(s, number_id)
+    if holder is not None:
+        lock_agent(s, holder.id)
+    num = _get_number(s, number_id)
+    if not num.spam_flag:
+        return num
+    num.spam_flag = False
+    num.spam_marked_at = None
+    num.spam_note = None
+    num.last_test_result = None  # tested again before it is treated as fine
+    num.test_awaiting_since = None
+    stack_top(s, num)
+    add_event(s, num.id, "marked_not_spam", "marked as not spam")
+    holder = holder_of(s, num.id)
+    if holder is not None and holder.pending_switch_reason == "spam":
+        holder.pending_switch = False  # the swap that was waiting is no longer needed
+        holder.pending_switch_reason = None
+    s.flush()
+    return num
+
+
+def record_test_result(s: Session, number_id: int, result: str, note: str | None = None) -> Number:
+    """A person's verdict after looking at the test call. 'spam' is the same as mark_spam."""
+    if result not in ("ok", "spam"):
+        raise AppError("VALIDATION_ERROR", "Invalid input: result", 422)
+    if result == "spam":
+        num = mark_spam(s, number_id, note)
+    else:
+        num = _get_number(s, number_id)
+    num.last_test_result = result
+    num.test_awaiting_since = None
+    if result == "ok":
+        stack_bottom(s, num)  # rotates round again later; no cooldown
+    add_event(s, num.id, "test_result", f"result: {result}")
+    s.flush()
+    return num

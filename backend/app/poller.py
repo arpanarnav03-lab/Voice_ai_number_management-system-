@@ -7,7 +7,7 @@ from datetime import timedelta
 
 from sqlalchemy import select
 
-from . import services
+from . import services, spam
 from .models import Call, utcnow
 
 log = logging.getLogger("bnm.poller")
@@ -55,6 +55,8 @@ async def poll_once(db, bolna, settings) -> int:
         if age > timedelta(minutes=settings.call_timeout_minutes):
             await run_in_threadpool(_unknown, db, call_id, "No final status from Bolna - please review")
             settled += 1
+    await spam.advance_runs(db, bolna, settings)  # next test call, one at a time
+    await run_in_threadpool(spam.expire_awaiting, db, settings)  # housekeeping only
     return settled
 
 

@@ -15,12 +15,14 @@ import time
 from .bolna_client import AgentNotFoundOnBolna, BolnaError
 
 # Obviously fake numbers (never real ones).
-SIM_NUMBERS = [
-    {"phone_number": f"+9180000000{i:02d}", "telephony_provider": "vobiz", "agent_id": None}
-    for i in range(1, 7)
-] + [
-    {"phone_number": "+918000000090", "telephony_provider": "plivo", "agent_id": None},
-    {"phone_number": "+918000000099", "telephony_provider": "vobiz", "agent_id": "sim-inbound-agent"},
+def _sim(phone: str, provider: str, agent_id=None) -> dict:
+    return {"id": f"{int(phone[1:]):032x}", "phone_number": phone, "telephony_provider": provider,
+            "agent_id": agent_id, "rented": True}
+
+
+SIM_NUMBERS = [_sim(f"+9180000000{i:02d}", "vobiz") for i in range(1, 7)] + [
+    _sim("+918000000090", "plivo"),
+    _sim("+918000000099", "vobiz", "sim-inbound-agent"),
 ]
 
 
@@ -28,13 +30,21 @@ class SimulatedBolna:
     def __init__(self, speed: float = 1.0):
         self.speed = speed  # >1 makes simulated calls finish faster
         self._sync_round = 0
+        self._numbers = [dict(n) for n in SIM_NUMBERS]  # what "Bolna" currently holds
 
     async def get_me(self) -> dict:
         return {"id": "sim", "name": "Simulated Bolna", "email": "sim@example.invalid",
                 "wallet": 0, "concurrency": {"max": 2, "current": 0}}
 
     async def list_phone_numbers(self) -> list[dict]:
-        return [dict(n) for n in SIM_NUMBERS]
+        return [dict(n) for n in self._numbers]
+
+    async def delete_phone_number(self, phone_number_id: str) -> dict:
+        before = len(self._numbers)
+        self._numbers = [n for n in self._numbers if n["id"] != phone_number_id]
+        if len(self._numbers) == before:
+            raise BolnaError("Phone number not found", 404)
+        return {"message": "The phone number has been removed from your account", "state": "deleted"}
 
     async def list_all_phone_numbers(self) -> list[dict]:
         """Scripted for the sync, one step per call, repeating:
@@ -46,9 +56,9 @@ class SimulatedBolna:
         self._sync_round += 1
         if step == 2:
             return []
-        nums = [dict(n) for n in SIM_NUMBERS] + [
-            {"phone_number": "+9180000", "telephony_provider": "vobiz", "agent_id": None},
-            {"phone_number": "+918000000100", "telephony_provider": "vobiz", "agent_id": None},
+        nums = [dict(n) for n in self._numbers] + [
+            {"id": "sim-invalid", "phone_number": "+9180000", "telephony_provider": "vobiz", "agent_id": None},
+            _sim("+918000000100", "vobiz"),
         ]
         if step == 1:
             nums = [n for n in nums if n["phone_number"] != "+918000000006"]
@@ -108,7 +118,8 @@ class FakeBolnaClient:
 
     def __init__(self, numbers: list[dict] | None = None):
         self.numbers = numbers if numbers is not None else [
-            {"phone_number": f"+91800{i:07d}", "telephony_provider": "vobiz", "agent_id": None}
+            {"id": f"{i:032x}", "phone_number": f"+91800{i:07d}", "telephony_provider": "vobiz",
+             "agent_id": None, "rented": True}
             for i in range(1, 41)
         ]
         self.executions: dict[str, dict] = {}
@@ -117,6 +128,8 @@ class FakeBolnaClient:
         self.missing_agents: set[str] = set()
         self.concurrency = {"max": 2, "current": 0}
         self._ids = itertools.count(1)
+        self.deleted: list[str] = []  # ids passed to delete_phone_number
+        self.delete_errors: dict[str, Exception] = {}  # id -> error raised by the delete
         self.list_error: Exception | None = None  # raised by list_all_phone_numbers
         self.list_delay: float = 0.0  # seconds, to hold a sync open
         self.list_calls = 0
@@ -134,6 +147,16 @@ class FakeBolnaClient:
         if self.list_error is not None:
             raise self.list_error
         return [dict(n) if isinstance(n, dict) else n for n in self.numbers]
+
+    async def delete_phone_number(self, phone_number_id: str) -> dict:
+        if phone_number_id in self.delete_errors:
+            raise self.delete_errors[phone_number_id]
+        found = [n for n in self.numbers if isinstance(n, dict) and n.get("id") == phone_number_id]
+        if not found:
+            raise BolnaError("Phone number not found", 404)
+        self.deleted.append(phone_number_id)
+        self.numbers = [n for n in self.numbers if n not in found]
+        return {"message": "The phone number has been removed from your account", "state": "deleted"}
 
     async def get_agent(self, agent_id: str) -> dict | None:
         if agent_id in self.missing_agents:

@@ -22,6 +22,7 @@ class BolnaClient(Protocol):
     async def get_me(self) -> dict: ...
     async def list_phone_numbers(self) -> list[dict]: ...
     async def list_all_phone_numbers(self) -> list[dict]: ...
+    async def delete_phone_number(self, phone_number_id: str) -> dict: ...
     async def place_call(self, agent_id: str, recipient: str, from_number: str,
                          user_data: dict | None = None) -> dict: ...
     async def get_execution(self, execution_id: str) -> dict: ...
@@ -84,6 +85,20 @@ class RealBolnaClient:
         if not isinstance(data, list):
             raise BolnaError("Bolna returned an unexpected response for the phone number list")
         return data
+
+    async def delete_phone_number(self, phone_number_id: str) -> dict:
+        """DELETE /phone-numbers/{id}. Permanent. Only the release flow calls this, never retried."""
+        try:
+            resp = await self._http.delete(f"/phone-numbers/{phone_number_id}")
+        except httpx.HTTPError as e:
+            raise BolnaError(f"Could not reach Bolna: {type(e).__name__}")
+        if resp.status_code >= 400:
+            raise BolnaError(self._message(resp), resp.status_code)
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
+        return data if isinstance(data, dict) else {}
 
     async def place_call(self, agent_id, recipient, from_number, user_data=None) -> dict:
         body: dict = {

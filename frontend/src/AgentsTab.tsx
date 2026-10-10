@@ -5,6 +5,7 @@ import { CountBar, Empty, LockIcon, TableBox, agentPill, useToast } from "./ui";
 
 function numberLabel(n: NumberRow) {
   if (n.missing_on_bolna) return `${n.phone_number} - not on Bolna`;
+  if (n.spam_flag) return `${n.phone_number} - marked as spam`;
   if (n.status === "limit_reached" && !n.used_by) return `${n.phone_number} - limit reached, cannot be assigned`;
   if (n.used_by) return `${n.phone_number} - in use by ${n.used_by.name}${n.used_by.on_call ? " (on a call)" : ""}`;
   return `${n.phone_number} - available`;
@@ -26,7 +27,7 @@ export default function AgentsTab() {
 
   const threshold = agents.data?.threshold ?? numbers.data?.threshold ?? 5;
   const pool = numbers.data?.items ?? [];
-  const firstFree = pool.find((n) => n.status === "available" && !n.used_by && !n.missing_on_bolna);
+  const firstFree = pool.find((n) => n.status === "available" && !n.used_by && !n.missing_on_bolna && !n.spam_flag);
 
   useEffect(() => {
     if (!numberId && firstFree) setNumberId(String(firstFree.id));
@@ -34,7 +35,9 @@ export default function AgentsTab() {
 
   const chosen = pool.find((n) => String(n.id) === numberId);
   let flag: JSX.Element | null = null;
-  if (chosen?.missing_on_bolna) {
+  if (chosen?.spam_flag) {
+    flag = <p><strong className="mono">{chosen.phone_number}</strong> is marked as spam, so it cannot be assigned. Choose another number.</p>;
+  } else if (chosen?.missing_on_bolna) {
     flag = <p><strong className="mono">{chosen.phone_number}</strong> is not on your Bolna account any more, so it cannot be assigned. Choose another number.</p>;
   } else if (chosen?.used_by) {
     flag = chosen.used_by.on_call ? (
@@ -65,7 +68,7 @@ export default function AgentsTab() {
   }
 
   const rows = agents.data?.items ?? [];
-  const canSelect = (a: AgentRow) => !!a.number && !a.on_call && a.status !== "pool_empty" && a.status !== "number_missing";
+  const canSelect = (a: AgentRow) => !!a.number && !a.on_call && a.status !== "pool_empty" && a.status !== "number_missing" && a.status !== "switching_spam";
   const chosenAgents = useMemo(() => rows.filter((a) => selected[a.id] && canSelect(a)), [rows, selected]);
   const recipientOk = (id: number) => PHONE_RE.test((recipients[id] || "").trim());
   const canTrigger = chosenAgents.length > 0 && chosenAgents.every((a) => recipientOk(a.id)) && !triggering;
@@ -111,7 +114,7 @@ export default function AgentsTab() {
             <label htmlFor="number-pick">Number</label>
             <select id="number-pick" value={numberId} onChange={(e) => setNumberId(e.target.value)}>
               <option value="" disabled>{pool.length ? "Choose a number" : "No numbers in the pool yet"}</option>
-              {pool.map((n) => <option key={n.id} value={n.id} disabled={n.missing_on_bolna}>{numberLabel(n)}</option>)}
+              {pool.map((n) => <option key={n.id} value={n.id} disabled={n.missing_on_bolna || n.spam_flag}>{numberLabel(n)}</option>)}
             </select>
           </div>
           <button className="btn btn-primary" disabled={busy || !!flag || !agentId.trim() || !numberId} onClick={assign}>Assign number</button>
@@ -161,6 +164,7 @@ export default function AgentsTab() {
                           <>
                             <span className="mono">{a.on_call && <><LockIcon /> </>}<Link to={`/numbers/${a.number.id}`}>{a.number.phone_number}</Link></span>
                             {a.number.missing_on_bolna && <span className="sub">Not on Bolna</span>}
+                            {a.number.spam_flag && <span className="sub">Marked as spam</span>}
                             {a.on_call && <span className="rowlock">Locked until the call ends</span>}
                             {a.on_call && <span className="sub">Can be changed after this call ends</span>}
                           </>

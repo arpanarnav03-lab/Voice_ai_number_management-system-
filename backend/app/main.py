@@ -10,7 +10,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import api, poller, sync
+from . import api, poller, services, spam, sync
 from .bolna_client import BolnaError, RealBolnaClient
 from .config import Settings
 from .db import Database
@@ -33,6 +33,12 @@ def create_app(settings: Settings | None = None, bolna=None, db: Database | None
             db.migrate()
         else:
             db.create_all()
+        spam.recover_releasing(db)
+        with db.session() as s:  # self-heal: the stack must hold exactly the non-spam pool numbers
+            fixed = services.reconcile_stack(s)
+        if fixed["added"] or fixed["removed"] or fixed["duplicates_fixed"]:
+            log.warning("startup repaired the test stack: %d added, %d removed, %d duplicate positions",
+                        fixed["added"], fixed["removed"], fixed["duplicates_fixed"])
         task = asyncio.create_task(poller.poll_loop(app)) if settings.start_poller else None
         sync_task = asyncio.create_task(sync.sync_loop(app)) if settings.start_poller else None
         log.info("Bolna Number Manager started in '%s' mode", settings.bolna_mode)

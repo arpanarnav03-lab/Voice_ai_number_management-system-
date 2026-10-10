@@ -32,11 +32,14 @@ export function agentPill(a: AgentRow) {
     case "on_call": return <Pill kind="on_call">On a call</Pill>;
     case "pool_empty": return <Pill kind="error">Pool empty</Pill>;
     case "number_missing": return <Pill kind="error">Number missing on Bolna</Pill>;
+    case "switching_spam": return <Pill kind="error">Switching after call (spam)</Pill>;
     default: return <Pill kind="neutral">No number</Pill>;
   }
 }
 
 export function numberPill(n: NumberRow) {
+  if (n.status === "released") return <Pill kind="neutral">Released</Pill>;
+  if (n.status === "releasing") return <Pill kind="neutral">Releasing</Pill>;
   if (n.status === "discovered") return <Pill kind="neutral">Discovered</Pill>;
   if (n.status === "ignored") return <Pill kind="neutral">Ignored</Pill>;
   if (n.status === "limit_reached") return <Pill kind="limit">Limit reached</Pill>;
@@ -44,6 +47,11 @@ export function numberPill(n: NumberRow) {
     return n.used_by?.on_call ? <Pill kind="on_call">In use, on a call</Pill> : <Pill kind="in_use">In use</Pill>;
   }
   return <Pill kind="available">Available</Pill>;
+}
+
+/** Red triangle badge for a number a person marked as spam. */
+export function SpamBadge({ n }: { n: Pick<NumberRow, "spam_flag"> }) {
+  return n.spam_flag ? <Pill kind="error">Spam</Pill> : null;
 }
 
 /** Red hollow-ring pill for a pool number that Bolna no longer lists. */
@@ -136,7 +144,7 @@ export function CallTable({ calls, showAgent, showNumber }: { calls: CallRow[]; 
               {showAgent && <td><Link to={`/agents/${c.agent_id}`}>{c.agent_name}</Link></td>}
               <td className="mono">{c.recipient}</td>
               {showNumber && <td className="mono"><Link to={`/numbers/${c.number_id}`}>{c.phone_number}</Link></td>}
-              <td title={c.reason}>{resultPill(c.result)}</td>
+              <td title={c.reason}>{resultPill(c.result)}{c.purpose === "test" && <> <Pill kind="neutral">Test</Pill></>}</td>
               <td className="mono">{fmtDuration(c.duration)}</td>
             </tr>
           ))}
@@ -152,6 +160,7 @@ export const REASON_TEXT: Record<string, string> = {
   auto_threshold: "Auto-switched, previous number hit the threshold",
   auto_refill: "Filled automatically when a number became available",
   released: "Released",
+  auto_spam: "Auto-swapped, previous number was marked as spam",
 };
 
 // ---------------------------------------------------------------- toasts

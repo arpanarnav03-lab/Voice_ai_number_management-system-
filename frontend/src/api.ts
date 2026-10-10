@@ -83,23 +83,25 @@ export type NumberRef = {
   connected_count: number;
   provider: string;
   missing_on_bolna: boolean;
+  spam_flag: boolean;
 };
 export type AgentRow = {
   id: number;
   bolna_agent_id: string;
   name: string;
   number: NumberRef | null;
-  status: "ready" | "near_limit" | "on_call" | "pool_empty" | "no_number" | "number_missing";
+  status: "ready" | "near_limit" | "on_call" | "pool_empty" | "no_number" | "number_missing" | "switching_spam";
   on_call: boolean;
   active_calls: number;
   pending_switch: boolean;
+  pending_switch_reason: "limit" | "spam" | null;
   last_used: string | null;
 };
 export type NumberRow = {
   id: number;
   phone_number: string;
   provider: string;
-  status: "available" | "in_use" | "limit_reached" | "discovered" | "ignored";
+  status: "available" | "in_use" | "limit_reached" | "discovered" | "ignored" | "releasing" | "released";
   connected_count: number;
   total_calls: number;
   agents_served: number;
@@ -111,8 +113,16 @@ export type NumberRow = {
   missing_on_bolna: boolean;
   missing_since: string | null;
   discovered_at: string | null;
+  spam_flag: boolean;
+  never_tested: boolean;
+  spam_marked_at: string | null;
+  spam_note: string | null;
+  last_tested_at: string | null;
+  last_test_result: "ok" | "spam" | null;
+  bolna_rented: boolean | null;
+  has_bolna_id: boolean;
   added_at: string;
-  used_by: { id: number; name: string; on_call: boolean; pending_switch: boolean } | null;
+  used_by: { id: number; name: string; on_call: boolean; pending_switch: boolean; pending_switch_reason: "limit" | "spam" | null } | null;
 };
 export type CallRow = {
   id: number;
@@ -127,6 +137,7 @@ export type CallRow = {
   result: "connected" | "voicemail" | "no_answer" | "busy" | "in_progress" | "unclear" | "failed";
   reason: string;
   needs_review: boolean;
+  purpose: "lead" | "test";
 };
 export type HistoryRow = {
   id: number;
@@ -165,6 +176,27 @@ export type NumberPage = {
   page: number;
   page_size: number;
   unlinked_total?: number;
+};
+
+export type NumberEvent = { id: number; event: string; detail: string; at: string };
+export type StackRow = NumberRow & {
+  position: number;
+  awaiting_result: boolean;
+  eligible: boolean;
+  is_next: boolean;
+  reason: { code: string; message: string } | null;
+  test: { status: "queued" | "calling"; position: number | null; run_id: number } | null;
+};
+export type Stack = { items: StackRow[]; total: number; never_tested: number; threshold: number };
+export type SpamListRow = NumberRow & { release_blocker: { code: string; message: string } | null };
+export type SpamList = { items: SpamListRow[]; released_count: number; delete_enabled: boolean };
+export type ReleaseResult = {
+  id: number;
+  phone_number: string | null;
+  ok: boolean;
+  outcome: "released" | "already_released" | "refused" | "failed";
+  code: string | null;
+  message: string;
 };
 
 export const PHONE_RE = /^\+91[0-9]{10}$/;

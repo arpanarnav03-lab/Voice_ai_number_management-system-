@@ -25,6 +25,10 @@ class Settings:
     default_threshold: int = 5
     sync_interval_minutes: float = 60.0  # 0 turns the scheduled sync (and the startup sync) off
     sync_auto_approve: bool = False  # unlinked discovered numbers go straight to 'available'
+    allow_bolna_number_delete: bool = False  # the release flow may DELETE numbers in Bolna
+    spam_test_max_per_run: int = 0  # 0 = no cap on how many numbers one run can test
+    test_result_expiry_hours: float = 24.0  # an unmarked test result is dismissed after this long
+    spam_test_delay_seconds: float = 5.0  # pause between two test calls of a run
     host: str = "127.0.0.1"
     port: int = 8000
     start_poller: bool = True
@@ -43,6 +47,10 @@ class Settings:
             call_timeout_minutes=_f("CALL_TIMEOUT_MINUTES", 30.0),
             sync_interval_minutes=_f("SYNC_INTERVAL_MINUTES", 60.0),
             sync_auto_approve=os.getenv("SYNC_AUTO_APPROVE", "").strip().lower() in ("1", "true", "yes", "on"),
+            allow_bolna_number_delete=os.getenv("ALLOW_BOLNA_NUMBER_DELETE", "").strip().lower()
+            in ("1", "true", "yes", "on"),
+            spam_test_max_per_run=int(_f("SPAM_TEST_MAX_PER_RUN", 0)),
+            test_result_expiry_hours=_f("TEST_RESULT_EXPIRY_HOURS", 24.0),
             host=os.getenv("HOST", "").strip() or "127.0.0.1",
             port=int(_f("PORT", 8000)),
         )
@@ -52,6 +60,10 @@ class Settings:
     def validate(self) -> None:
         if self.bolna_mode not in ("fake", "real"):
             raise SystemExit("BOLNA_MODE must be 'fake' or 'real'")
+        if self.spam_test_max_per_run < 0:
+            raise SystemExit("SPAM_TEST_MAX_PER_RUN must be 0 (no cap) or more")
+        if self.test_result_expiry_hours <= 0:
+            raise SystemExit("TEST_RESULT_EXPIRY_HOURS must be more than 0")
         if self.sync_interval_minutes < 0:
             raise SystemExit("SYNC_INTERVAL_MINUTES must be 0 or more")
         if self.bolna_mode == "real" and not self.bolna_api_key:
