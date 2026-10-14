@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { AgentRow, ApiError, CallRow, HistoryRow, NumberRow, PHONE_HINT, PHONE_RE, api, fmtTime, useApi } from "./api";
-import { CallTable, CountBar, Empty, LockIcon, REASON_TEXT, TableBox, agentPill, useToast } from "./ui";
+import { CallTable, CountBar, END_REASON_TEXT, Empty, LockIcon, REASON_TEXT, TableBox, agentPill, useToast } from "./ui";
 
 type Detail = {
   agent: AgentRow;
@@ -37,6 +37,17 @@ export default function AgentDetail() {
     if (n.used_by) return `Used by ${n.used_by.name}${n.used_by.on_call ? ", on a call" : ""}. Cannot be taken.`;
     if (n.status === "limit_reached" || n.connected_count >= threshold) return `${n.connected_count} / ${threshold} connected calls. Cannot be assigned.`;
     return null;
+  }
+
+  async function setNeverLend(value: boolean) {
+    try {
+      await api.put(`/api/agents/${agent.id}/never-lend`, { never_lend: value });
+      toast(value ? `${agent.name}'s number will never be taken for another agent.` : `${agent.name}'s number may be lent when it is idle.`);
+    } catch (e) {
+      toast((e as ApiError).message, "error");
+    } finally {
+      detail.reload();
+    }
   }
 
   async function confirm() {
@@ -87,9 +98,13 @@ export default function AgentDetail() {
             <h1>{agent.name}</h1>
             <span className="mono muted">{agent.bolna_agent_id}</span>
             <div style={{ marginTop: 6 }}>{agentPill(agent)}</div>
+            <label className="toggle">
+              <input type="checkbox" role="switch" checked={agent.never_lend} onChange={(e) => setNeverLend(e.target.checked)} />
+              Never take this agent's number
+            </label>
           </div>
           <div className="row">
-            <button className="btn" disabled={locked} aria-expanded={panel === "change"} onClick={() => { setPanel(panel === "change" ? "none" : "change"); setPick(null); }}>Change number</button>
+            <button className="btn" disabled={locked} aria-expanded={panel === "change"} onClick={() => { setPanel(panel === "change" ? "none" : "change"); setPick(null); }}>{cur ? "Change number" : "Assign a number"}</button>
             <button className="btn btn-primary" disabled={!canCall} aria-expanded={panel === "call"} onClick={() => setPanel(panel === "call" ? "none" : "call")}>Trigger a call</button>
           </div>
         </div>
@@ -97,11 +112,17 @@ export default function AgentDetail() {
         {agent.pending_switch && agent.pending_switch_reason === "spam" && <p className="flag" role="alert">This agent's number was marked as spam. It will be swapped for a clean number as soon as its current calls end, and new calls are blocked until then.</p>}
         {agent.pending_switch && agent.pending_switch_reason !== "spam" && <p className="notice">The number reached its limit. The agent switches to the next available number when the current call ends.</p>}
         {agent.status === "number_missing" && <p className="flag" role="alert">This agent's number is not on your Bolna account any more, so calls are blocked. Nothing was switched automatically: change its number by hand.</p>}
+        {agent.status === "number_taken" && agent.number_taken && (
+          <p className="notice" role="status">
+            No number. Its number was moved to {agent.number_taken.by ? <Link to={`/agents/${agent.number_taken.by.id}`}>{agent.number_taken.by.name}</Link> : "another agent"} on {fmtTime(agent.number_taken.at)} because this agent was idle.
+            {" "}Nothing gives it a number automatically: use <strong>Assign a number</strong> to choose one.
+          </p>
+        )}
         {agent.status === "pool_empty" && <p className="flag" role="alert">No number is available for this agent. Add a number to the pool or reset one and it is filled automatically.</p>}
 
         {panel === "change" && (
           <fieldset disabled={locked} style={{ marginTop: 12 }}>
-            <legend><h3>Choose a new number</h3></legend>
+            <legend><h3>{cur ? "Choose a new number" : "Assign a number"}</h3></legend>
             <div className="radiolist" role="radiogroup" aria-label="Pool numbers">
               {(numbers.data?.items ?? []).map((n) => {
                 const why = reason(n);
@@ -152,6 +173,7 @@ export default function AgentDetail() {
         <div className="stat"><div className="label">Calls placed</div><div className="value">{summary.calls_placed}</div></div>
         <div className="stat"><div className="label">Connected calls</div><div className="value">{summary.connected_calls}</div></div>
         <div className="stat"><div className="label">Number switches</div><div className="value">{summary.number_switches}</div></div>
+        <div className="stat"><div className="label">Last call</div><div className="value" style={{ fontSize: 17 }}>{agent.last_call_at ? fmtTime(agent.last_call_at) : "Never"}</div></div>
       </div>
 
       <section className="card">
@@ -167,7 +189,7 @@ export default function AgentDetail() {
                     <td>{fmtTime(h.started_at)}</td>
                     <td>{h.ended_at ? fmtTime(h.ended_at) : "Now"}</td>
                     <td className="mono">{h.connected_calls}</td>
-                    <td>{REASON_TEXT[h.reason] ?? h.reason}</td>
+                    <td>{REASON_TEXT[h.reason] ?? h.reason}{h.end_reason && END_REASON_TEXT[h.end_reason] && <span className="sub">{END_REASON_TEXT[h.end_reason]}</span>}</td>
                   </tr>
                 ))}
               </tbody>

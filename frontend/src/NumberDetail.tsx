@@ -8,6 +8,7 @@ type Detail = {
   agents: { agent_id: number; agent_name: string; started_at: string; ended_at: string | null; calls: number; connected_calls: number; reason: string }[];
   calls: CallRow[];
   events: NumberEvent[];
+  moves: { id: number; detail: string; at: string }[];
 };
 
 const EVENT_TEXT: Record<string, string> = {
@@ -18,6 +19,7 @@ const EVENT_TEXT: Record<string, string> = {
   release_started: "Release started",
   release_succeeded: "Released from the pool and Bolna",
   release_failed: "Release failed",
+  moved_idle: "Moved to another agent (the holder was idle)",
 };
 
 export default function NumberDetail() {
@@ -31,7 +33,7 @@ export default function NumberDetail() {
     return <section className="card"><p role="alert" className="field-err">{d.error.message}</p><Link to="/pool">Back to the pool</Link></section>;
   }
   if (!d.data) return <section className="card"><p className="muted">Loading...</p></section>;
-  const { number: n, agents, calls, events } = d.data;
+  const { number: n, agents, calls, events, moves } = d.data;
   const testCalls = calls.filter((c) => c.purpose === "test");
 
   async function reset() {
@@ -95,6 +97,20 @@ export default function NumberDetail() {
         <div className="stat"><div className="label">Agents that used it</div><div className="value">{n.agents_served}</div></div>
         <div className="stat"><div className="label">Provider</div><div className="value" style={{ fontSize: 17 }}>{n.provider}</div></div>
       </div>
+
+      <section className="card" aria-labelledby="moves-h">
+        <h2 id="moves-h">Taken from the pool</h2>
+        <p>{n.taken_from_pool_at ? `Taken from the pool on ${fmtTime(n.taken_from_pool_at)}.` : <span className="muted">Not held by an agent right now.</span>}</p>
+        <h3 style={{ marginTop: 12 }}>Moves between agents</h3>
+        {!moves.length ? <Empty>This number has not been moved between agents.</Empty> : (
+          <TableBox>
+            <table>
+              <thead><tr><th>When</th><th>Move</th></tr></thead>
+              <tbody>{moves.map((m) => <tr key={m.id}><td>{fmtTime(m.at)}</td><td>{m.detail}</td></tr>)}</tbody>
+            </table>
+          </TableBox>
+        )}
+      </section>
 
       <section className="card" aria-labelledby="spam-h">
         <h2 id="spam-h">Spam check</h2>

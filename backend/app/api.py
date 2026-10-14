@@ -35,8 +35,14 @@ def _last_used(s) -> dict[int, object]:
     return {a: t for a, t in s.execute(q)}
 
 
+def _last_call(s) -> dict[int, object]:
+    q = select(Call.agent_id, func.max(Call.placed_at)).group_by(Call.agent_id)  # lead or test
+    return {a: t for a, t in s.execute(q)}
+
+
 def agent_rows(s, agents: list[Agent], threshold: int) -> list[dict]:
-    active, last = _active_counts(s), _last_used(s)
+    active, last, last_any = _active_counts(s), _last_used(s), _last_call(s)
+    names = {a.id: a.name for a in s.scalars(select(Agent))}
     rows = []
     for a in agents:
         n = a.current_number
@@ -45,6 +51,8 @@ def agent_rows(s, agents: list[Agent], threshold: int) -> list[dict]:
             status = "switching_spam"
         elif ac > 0:
             status = "on_call"
+        elif n is None and a.number_taken_at is not None:
+            status = "number_taken"
         elif n is not None and n.missing_on_bolna:
             status = "number_missing"
         elif a.pool_empty:
@@ -63,7 +71,12 @@ def agent_rows(s, agents: list[Agent], threshold: int) -> list[dict]:
                 "missing_on_bolna": n.missing_on_bolna, "spam_flag": n.spam_flag},
             "status": status, "on_call": ac > 0, "active_calls": ac,
             "pending_switch": a.pending_switch, "pending_switch_reason": a.pending_switch_reason,
-            "last_used": iso(last.get(a.id)),
+            "last_used": iso(last.get(a.id)), "last_call_at": iso(last_any.get(a.id)),
+            "never_lend": a.never_lend,
+            "number_taken": None if a.number_taken_at is None or n is not None else {
+                "at": iso(a.number_taken_at), "reason": a.number_taken_reason,
+                "by": None if a.number_taken_by_agent_id is None else {
+                    "id": a.number_taken_by_agent_id, "name": names.get(a.number_taken_by_agent_id, "?")}},
         })
     return rows
 
@@ -86,6 +99,7 @@ def number_rows(s, numbers: list[Number], threshold: int) -> list[dict]:
             "missing_since": iso(n.missing_since), "discovered_at": iso(n.discovered_at),
             "spam_flag": n.spam_flag, "spam_marked_at": iso(n.spam_marked_at), "spam_note": n.spam_note,
             "never_tested": n.last_tested_at is None and n.last_test_result is None,
+            "taken_from_pool_at": iso(n.taken_from_pool_at),
             "last_tested_at": iso(n.last_tested_at), "last_test_result": n.last_test_result,
             "bolna_rented": n.bolna_rented, "has_bolna_id": bool(n.bolna_phone_number_id),
             "used_by": None if h is None else {
@@ -254,8 +268,11 @@ def number_detail(number_id: int, request: Request):
                           .order_by(Call.placed_at.desc()).limit(200)).all()
         events = s.scalars(select(NumberEvent).where(NumberEvent.number_id == n.id)
                            .order_by(NumberEvent.at.desc(), NumberEvent.id.desc()).limit(100)).all()
+        moves = s.scalars(select(NumberEvent).where(NumberEvent.number_id == n.id, NumberEvent.event == "moved_idle")
+                          .order_by(NumberEvent.at.desc(), NumberEvent.id.desc())).all()
         return {"number": number_rows(s, [n], th)[0], "agents": agents, "calls": call_rows(s, calls),
-                "events": [{"id": e.id, "event": e.event, "detail": e.detail, "at": iso(e.at)} for e in events]}
+                "events": [{"id": e.id, "event": e.event, "detail": e.detail, "at": iso(e.at)} for e in events],
+                "moves": [{"id": e.id, "detail": e.detail, "at": iso(e.at)} for e in moves]}
 
 
 class ApproveBody(BaseModel):
@@ -518,7 +535,11 @@ async def spam_release(body: ReleaseBody, request: Request):
 # ------------------------------------------------------------------ agents
 class AssignBody(BaseModel):
     bolna_agent_id: str
-    number_id: int
+    number_id: int | None = None  # None = assign automatically from the pool
+
+
+class NeverLendBody(BaseModel):
+    never_lend: bool
 
 
 class ChangeBody(BaseModel):
@@ -588,6 +609,13 @@ def change_number(agent_id: int, body: ChangeBody, request: Request):
         a = services.change_number(s, agent_id, body.number_id)
         th = services.get_threshold(s)
         return agent_rows(s, [a], th)[0]
+
+
+@protected.put("/agents/{agent_id}/never-lend")
+def put_never_lend(agent_id: int, body: NeverLendBody, request: Request):
+    with request.app.state.db.session() as s:
+        a = services.set_never_lend(s, agent_id, body.never_lend)
+        return agent_rows(s, [a], services.get_threshold(s))[0]
 
 
 # ------------------------------------------------------------------ calls

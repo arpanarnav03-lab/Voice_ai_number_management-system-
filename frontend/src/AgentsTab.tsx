@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { AgentRow, ApiError, NumberRow, PHONE_HINT, PHONE_RE, api, fmtTime, useApi } from "./api";
 import { CountBar, Empty, LockIcon, TableBox, agentPill, useToast } from "./ui";
@@ -18,7 +18,8 @@ export default function AgentsTab() {
   const account = useApi<{ mode: string; concurrency: { max: number; current: number } | null }>("/api/account", 30000);
 
   const [agentId, setAgentId] = useState("");
-  const [numberId, setNumberId] = useState("");
+  const AUTO = "auto";
+  const [numberId, setNumberId] = useState(AUTO); // default: the first suitable pool number
   const [busy, setBusy] = useState(false);
   const [selected, setSelected] = useState<Record<number, boolean>>({});
   const [recipients, setRecipients] = useState<Record<number, string>>({});
@@ -28,10 +29,6 @@ export default function AgentsTab() {
   const threshold = agents.data?.threshold ?? numbers.data?.threshold ?? 5;
   const pool = numbers.data?.items ?? [];
   const firstFree = pool.find((n) => n.status === "available" && !n.used_by && !n.missing_on_bolna && !n.spam_flag);
-
-  useEffect(() => {
-    if (!numberId && firstFree) setNumberId(String(firstFree.id));
-  }, [firstFree, numberId]);
 
   const chosen = pool.find((n) => String(n.id) === numberId);
   let flag: JSX.Element | null = null;
@@ -54,11 +51,13 @@ export default function AgentsTab() {
   async function assign() {
     setBusy(true);
     try {
-      const a = await api.post<AgentRow>("/api/agents", { bolna_agent_id: agentId.trim(), number_id: Number(numberId) });
-      toast(`${a.name} now uses ${a.number?.phone_number}.`);
+      const body = numberId === AUTO ? { bolna_agent_id: agentId.trim() } : { bolna_agent_id: agentId.trim(), number_id: Number(numberId) };
+      const a = await api.post<AgentRow>("/api/agents", body);
+      if (a.number) toast(`${a.name} now uses ${a.number.phone_number}.`);
+      else toast(`${a.name} was added and is waiting: no suitable number is free in the pool. It gets one automatically when a number is added.`, "warn");
       await Promise.all([agents.reload(), numbers.reload()]);
       setAgentId("");
-      setNumberId(""); // the effect then picks the first free number from the fresh list
+      setNumberId(AUTO);
     } catch (e) {
       toast((e as ApiError).message, "error");
       numbers.reload();
@@ -113,7 +112,7 @@ export default function AgentsTab() {
           <div className="grow">
             <label htmlFor="number-pick">Number</label>
             <select id="number-pick" value={numberId} onChange={(e) => setNumberId(e.target.value)}>
-              <option value="" disabled>{pool.length ? "Choose a number" : "No numbers in the pool yet"}</option>
+              <option value={AUTO}>Assign automatically from the pool</option>
               {pool.map((n) => <option key={n.id} value={n.id} disabled={n.missing_on_bolna || n.spam_flag}>{numberLabel(n)}</option>)}
             </select>
           </div>
@@ -122,7 +121,7 @@ export default function AgentsTab() {
         {flag && (
           <div className="flag" role="alert">
             {flag}
-            <button className="btn" onClick={() => setNumberId(firstFree ? String(firstFree.id) : "")}>Choose another</button>
+            <button className="btn" onClick={() => setNumberId(firstFree ? String(firstFree.id) : AUTO)}>Choose another</button>
           </div>
         )}
         {!pool.length && numbers.data && <p className="helper">Add numbers on the <Link to="/pool">Number Pool</Link> tab first.</p>}
@@ -168,6 +167,10 @@ export default function AgentsTab() {
                             {a.on_call && <span className="rowlock">Locked until the call ends</span>}
                             {a.on_call && <span className="sub">Can be changed after this call ends</span>}
                           </>
+                        ) : a.number_taken ? (
+                          <span className="sub">
+                            Number moved to {a.number_taken.by ? <Link to={`/agents/${a.number_taken.by.id}`}>{a.number_taken.by.name}</Link> : "another agent"} on {fmtTime(a.number_taken.at)}: idle
+                          </span>
                         ) : <span className="muted">None</span>}
                       </td>
                       <td>{a.number ? <CountBar count={a.number.connected_count} threshold={threshold} /> : <span className="muted">-</span>}</td>

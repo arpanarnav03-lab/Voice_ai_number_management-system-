@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import api, poller, services, spam, sync
+from .actionlog import ActionLog, ActionLogMiddleware
 from .bolna_client import BolnaError, RealBolnaClient
 from .config import Settings
 from .db import Database
@@ -26,6 +27,9 @@ def create_app(settings: Settings | None = None, bolna=None, db: Database | None
     if bolna is None:
         bolna = RealBolnaClient(settings.bolna_api_key) if settings.bolna_mode == "real" else SimulatedBolna()
     db = db or Database(settings.database_url)
+    db.session_info["alloc"] = services.AllocationRules(
+        idle_first=settings.idle_first_enabled, idle_hours=settings.idle_hours,
+        cooldown_hours=settings.number_move_cooldown_hours, test_expiry_hours=settings.test_result_expiry_hours)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -54,8 +58,13 @@ def create_app(settings: Settings | None = None, bolna=None, db: Database | None
                         pass
             await bolna.aclose()
             db.dispose()
+            if action_log:
+                action_log.close()  # flush the record of changing requests
 
     app = FastAPI(title="Bolna Number Manager", lifespan=lifespan)
+    action_log = ActionLog(settings.action_log_path) if settings.action_log_path else None
+    if action_log:
+        app.add_middleware(ActionLogMiddleware, log=action_log)
     app.state.settings = settings
     app.state.bolna = bolna
     app.state.db = db

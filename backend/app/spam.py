@@ -42,6 +42,8 @@ def create_run(s: Session, number_ids: list[int], agent: Agent, reviewer_phone: 
         raise AppError("TEST_RUN_TOO_LARGE",
                        f"A run can test at most {max_per_run} numbers (each call costs money).", 422,
                        max=max_per_run)
+    if agent.current_number_id is None and agent.number_taken_at is not None:
+        raise services.number_taken_error(s, agent)
     if agent.pending_switch and agent.pending_switch_reason == "spam":
         raise AppError("AGENT_SWITCHING", f"{agent.name} is waiting to swap a spam number.", 409)
     accepted, refused = [], []

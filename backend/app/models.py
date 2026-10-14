@@ -56,6 +56,8 @@ class Number(Base):
     stack_order: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # a test call ended and nobody has marked the number yet
     test_awaiting_since: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # when the number last went from the pool to an agent (kept by an idle move, cleared on return)
+    taken_from_pool_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 POOL_STATUSES = ("available", "in_use", "limit_reached")
@@ -75,9 +77,16 @@ class Agent(Base):
     pool_empty: Mapped[bool] = mapped_column(Boolean, default=False)
     waiting_since: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     pool_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # idle-first swapping: a person can protect an agent, and an agent whose number was lent away
+    # stays without one ("Number taken") until a person gives it a number
+    never_lend: Mapped[bool] = mapped_column(Boolean, default=False)
+    number_taken_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    number_taken_by_agent_id: Mapped[int | None] = mapped_column(ForeignKey("agents.id"), nullable=True)
+    number_taken_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     current_number: Mapped[Number | None] = relationship(foreign_keys=[current_number_id])
+    number_taken_by: Mapped["Agent | None"] = relationship(foreign_keys=[number_taken_by_agent_id], remote_side=[id])
 
 
 class Assignment(Base):
@@ -94,9 +103,9 @@ class Assignment(Base):
     number_id: Mapped[int] = mapped_column(ForeignKey("numbers.id"))
     started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    # why it started: initial | manual | auto_threshold | auto_refill
+    # why it started: initial | manual | auto_threshold | auto_refill | auto_spam | auto_idle_swap
     reason: Mapped[str] = mapped_column(String(24))
-    # why it ended: manual | auto_threshold | released (NULL while open)
+    # why it ended: manual | auto_threshold | auto_spam | taken_idle | released (NULL while open)
     end_reason: Mapped[str | None] = mapped_column(String(24), nullable=True)
     connected_calls: Mapped[int] = mapped_column(Integer, default=0)
 

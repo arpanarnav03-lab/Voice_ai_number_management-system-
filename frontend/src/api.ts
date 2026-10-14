@@ -90,12 +90,15 @@ export type AgentRow = {
   bolna_agent_id: string;
   name: string;
   number: NumberRef | null;
-  status: "ready" | "near_limit" | "on_call" | "pool_empty" | "no_number" | "number_missing" | "switching_spam";
+  status: "ready" | "near_limit" | "on_call" | "pool_empty" | "no_number" | "number_missing" | "switching_spam" | "number_taken";
   on_call: boolean;
   active_calls: number;
   pending_switch: boolean;
   pending_switch_reason: "limit" | "spam" | null;
   last_used: string | null;
+  last_call_at: string | null;
+  never_lend: boolean;
+  number_taken: { at: string; reason: string | null; by: { id: number; name: string } | null } | null;
 };
 export type NumberRow = {
   id: number;
@@ -115,6 +118,7 @@ export type NumberRow = {
   discovered_at: string | null;
   spam_flag: boolean;
   never_tested: boolean;
+  taken_from_pool_at: string | null;
   spam_marked_at: string | null;
   spam_note: string | null;
   last_tested_at: string | null;

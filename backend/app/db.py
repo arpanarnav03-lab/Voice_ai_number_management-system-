@@ -23,6 +23,7 @@ class Database:
         if self.is_sqlite:
             self._configure_sqlite()
         self._factory = sessionmaker(self.engine, expire_on_commit=False, future=True)
+        self.session_info: dict = {}  # copied into every session (e.g. the allocation rules)
 
     def _configure_sqlite(self) -> None:
         @event.listens_for(self.engine, "connect")
@@ -41,6 +42,7 @@ class Database:
     @contextmanager
     def session(self):
         s: Session = self._factory()
+        s.info.update(self.session_info)
         try:
             yield s
             s.commit()

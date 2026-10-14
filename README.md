@@ -123,3 +123,44 @@ the API output and logs (`+91 98XXXXXX01`).
 
 Phase 5 (optional, ask first): syncing calls made outside the dashboard and "Sync numbers from
 Bolna". Also out of scope for v1: campaigns/batches, buying numbers, roles, per-number thresholds.
+
+## Sharing with a quick tunnel
+
+To let your team use the app from their own computers, run a Cloudflare quick tunnel. It gives a
+temporary public link such as `https://<random-words>.trycloudflare.com`.
+
+1. Install the tunnel program once: `brew install cloudflared`.
+2. Make sure the backend virtual environment and `frontend/node_modules` exist (see Quick start).
+3. From the project root run:
+
+   ```bash
+   ./scripts/share.sh          # uses backend/.env
+   ./scripts/share.sh --demo   # fake Bolna for this session only; .env is not touched
+   ```
+
+The script checks its requirements, starts the backend (or reuses one already running on port 8000),
+builds the front end, serves the build on `127.0.0.1:4173`, opens the tunnel, keeps the Mac awake
+and prints a banner and then the link. The backend itself stays on `127.0.0.1`; only the tunnel reaches it.
+
+**Read the banner.** It always says whether the link needs a password or has **no login**, whether Bolna
+is **LIVE (calls are real)** or **FAKE**, and whether Bolna deletion is **ON**. **Anyone who has the link
+can use the whole app: with no password and live mode they can place real calls, and with deletion on they
+can release (permanently delete) numbers from Bolna.** Only share it with people you trust.
+
+- **Stop sharing:** press `Ctrl+C`. The link stops working at once and the next run gives a different one.
+- The laptop must stay on and online while you share (the script keeps it awake with `caffeinate`).
+- Logs are in `.share/` (ignored by git). The link is never written to a file.
+
+### Record of changes
+
+Because there is no login, every request that changes something (POST, PUT, PATCH, DELETE) is added to
+`.share/actions.log`, one line each: time, method, path, response status and the caller's address
+(`CF-Connecting-IP` when it came through the tunnel). Request bodies, query strings and keys are never
+logged, and phone numbers in a path are masked to their last four digits.
+
+```bash
+tail -f .share/actions.log          # watch live
+grep " 200 " .share/actions.log     # only the requests that succeeded
+```
+
+Set `ACTION_LOG_FILE` to use another file, or `ACTION_LOG_FILE=` (empty) to switch the record off.

@@ -33,6 +33,7 @@ export function agentPill(a: AgentRow) {
     case "pool_empty": return <Pill kind="error">Pool empty</Pill>;
     case "number_missing": return <Pill kind="error">Number missing on Bolna</Pill>;
     case "switching_spam": return <Pill kind="error">Switching after call (spam)</Pill>;
+    case "number_taken": return <Pill kind="limit">Number taken</Pill>;
     default: return <Pill kind="neutral">No number</Pill>;
   }
 }
@@ -161,6 +162,12 @@ export const REASON_TEXT: Record<string, string> = {
   auto_refill: "Filled automatically when a number became available",
   released: "Released",
   auto_spam: "Auto-swapped, previous number was marked as spam",
+  auto_idle_swap: "Received from an idle agent",
+};
+
+/** Why an assignment ended, when that is worth saying in plain words. */
+export const END_REASON_TEXT: Record<string, string> = {
+  taken_idle: "Moved to another agent because this agent was idle",
 };
 
 // ---------------------------------------------------------------- toasts

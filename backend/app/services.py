@@ -3,6 +3,7 @@
 are serialised; on Postgres the agent / number rows are locked with SELECT ... FOR UPDATE."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -21,6 +22,20 @@ from .models import (
 from .validation import mask_phone, validate_phone
 
 DEFAULT_THRESHOLD = 5
+log = logging.getLogger("bnm.alloc")
+
+
+@dataclass
+class AllocationRules:
+    """Settings that allocation needs. The app puts them in every session's `info`."""
+    idle_first: bool = True
+    idle_hours: float = 24.0
+    cooldown_hours: float = 24.0
+    test_expiry_hours: float = 24.0
+
+
+def _rules(s: Session) -> AllocationRules:
+    return s.info.get("alloc") or AllocationRules()
 
 
 # ---------------------------------------------------------------- settings
@@ -126,8 +141,13 @@ def _check_assignable(s: Session, number: Number, threshold: int) -> None:
         )
 
 
-def _assign(s: Session, agent: Agent, number: Number, reason: str) -> None:
+def _assign(s: Session, agent: Agent, number: Number, reason: str, from_pool: bool = True) -> None:
+    if from_pool:
+        number.taken_from_pool_at = utcnow()  # an idle move between agents keeps the original time
     agent.current_number_id = number.id
+    agent.number_taken_at = None  # whoever gets a number is no longer "Number taken"
+    agent.number_taken_by_agent_id = None
+    agent.number_taken_reason = None
     agent.pool_empty = False
     agent.pending_switch = False
     agent.pending_switch_reason = None
@@ -151,6 +171,7 @@ def _release(s: Session, agent: Agent, end_reason: str, threshold: int) -> Numbe
         a.end_reason = end_reason
     number.status = "limit_reached" if (
         number.status == "limit_reached" or number.connected_count >= threshold) else "available"
+    number.taken_from_pool_at = None  # back in the pool
     reconcile_number_in_stack(s, number)  # released back to the pool: still a member
     agent.current_number_id = None
     s.flush()
@@ -342,17 +363,21 @@ def reset_number(s: Session, number_id: int) -> Number:
 
 
 # ---------------------------------------------------------------- agents
-def assign_new_agent(s: Session, bolna_agent_id: str, number_id: int, name: str | None) -> Agent:
+def assign_new_agent(s: Session, bolna_agent_id: str, number_id: int | None, name: str | None) -> Agent:
+    """Create (or reuse) an agent and give it a number: the one a person chose, or with number_id=None
+    the first suitable pool number. Never a number from another agent. With nothing suitable in the
+    pool the agent waits as `pool_empty` and is filled by auto-refill."""
     bolna_agent_id = (bolna_agent_id or "").strip()
     if not bolna_agent_id:
         raise AppError("AGENT_NOT_FOUND", "Enter a Bolna agent ID", 422)
     threshold = get_threshold(s)
-    number = _get_number(s, number_id)
+    number = _get_number(s, number_id) if number_id is not None else None
     agent = s.scalar(select(Agent).where(Agent.bolna_agent_id == bolna_agent_id).with_for_update())
     if agent is not None and agent.current_number_id is not None:
         raise AppError("AGENT_HAS_NUMBER",
                        f"{agent.name} already has a number. Use Change number on its page.", 409)
-    _check_assignable(s, number, threshold)
+    if number is not None:
+        _check_assignable(s, number, threshold)
     if agent is None:
         agent = Agent(bolna_agent_id=bolna_agent_id, name=name or f"Agent {bolna_agent_id[:8]}")
         s.add(agent)
@@ -360,7 +385,17 @@ def assign_new_agent(s: Session, bolna_agent_id: str, number_id: int, name: str 
     elif name:
         agent.name = name
     had_before = s.scalar(select(func.count()).select_from(Assignment).where(Assignment.agent_id == agent.id))
-    _assign(s, agent, number, "manual" if had_before else "initial")
+    reason = "manual" if had_before else "initial"
+    if number is None:
+        number = pick_available(s, None, threshold)  # pool order, no provider to match
+    if number is not None:
+        _assign(s, agent, number, reason)
+    else:
+        agent.number_taken_at = agent.number_taken_by_agent_id = agent.number_taken_reason = None
+        agent.pool_empty = True
+        agent.waiting_since = utcnow()
+        agent.pool_provider = None
+        s.flush()
     return agent
 
 
@@ -395,6 +430,8 @@ def begin_call(s: Session, agent_id: int, recipient: str) -> CallPlan:
     agent counts as 'on a call', so no number change can sneak in."""
     recipient = validate_phone(recipient)
     agent = lock_agent(s, agent_id)
+    if agent.current_number_id is None and agent.number_taken_at is not None:
+        raise number_taken_error(s, agent)
     if agent.pool_empty:
         raise AppError("POOL_EMPTY", f"No number is available for {agent.name}. Add or reset a number first.", 409)
     if agent.current_number_id is None:
@@ -467,9 +504,17 @@ def _after_settle(s: Session, agent: Agent, threshold: int) -> None:
 
 
 def _switch(s: Session, agent: Agent, threshold: int, reason: str = "auto_threshold") -> None:
+    """An automatic swap (threshold or spam). Idle-first: take the number of an idle agent, else the
+    pool, else wait as pool_empty. Runs when the swap actually happens, so a deferred swap judges the
+    lenders at that moment."""
     old = agent.current_number
     provider = old.provider if old is not None else agent.pool_provider
     _release(s, agent, reason, threshold)
+    if old is not None and reason in ("auto_threshold", "auto_spam") and _rules(s).idle_first:
+        got = take_from_idle_agent(s, agent, provider, threshold,
+                                   "auto_idle_swap" if reason == "auto_threshold" else "auto_spam")
+        if got is not None:
+            return
     new = pick_available(s, provider, threshold)
     if new is not None:
         _assign(s, agent, new, reason)
@@ -480,6 +525,129 @@ def _switch(s: Session, agent: Agent, threshold: int, reason: str = "auto_thresh
         agent.waiting_since = utcnow()
         agent.pool_provider = provider
         s.flush()
+
+
+# ---------------------------------------------------------------- idle-first lending
+def last_activity(s: Session, agent: Agent) -> object:
+    """When the agent last placed a call (lead or test); if never, when its current assignment
+    started, so a freshly assigned agent does not count as idle."""
+    last = s.scalar(select(func.max(Call.placed_at)).where(Call.agent_id == agent.id))
+    if last is not None:
+        return last
+    return s.scalar(select(func.max(Assignment.started_at)).where(
+        Assignment.agent_id == agent.id, Assignment.ended_at.is_(None)))
+
+
+def lender_block(s: Session, lender: Agent, receiver_id: int, provider: str | None, threshold: int) -> str | None:
+    """Why `lender` may not lend its number right now, or None when it may."""
+    rules = _rules(s)
+    now = utcnow()
+    num = lender.current_number
+    if num is None:
+        return "has no number"
+    if lender.id == receiver_id:
+        return "is the agent that needs a number"
+    if lender.never_lend:
+        return "is marked Never take this agent's number"
+    if lender.pending_switch:
+        return "has a pending switch"
+    if active_call_count(s, lender.id) > 0:
+        return "has a call in progress"
+    if s.scalar(select(func.count()).select_from(SpamTestRun).where(
+            SpamTestRun.test_agent_id == lender.id, SpamTestRun.status == "running")):
+        return "is the test agent of a running test run"
+    last = last_activity(s, lender)
+    if last is not None and now - last < timedelta(hours=rules.idle_hours):
+        return "was active recently"
+    if num.connected_count >= threshold or num.status == "limit_reached":
+        return "number is at its limit"
+    if num.spam_flag:
+        return "number is marked as spam"
+    if num.missing_on_bolna:
+        return "number is not on Bolna"
+    if not num.allow_auto_switch:
+        return "number is not allowed for auto-switching"
+    if num.linked_in_bolna:
+        return "number is linked in Bolna"
+    if provider and num.provider != provider:
+        return "number is from another provider"
+    if s.scalar(select(func.count()).select_from(SpamTestItem).join(SpamTestRun, SpamTestRun.id == SpamTestItem.run_id)
+                .where(SpamTestItem.number_id == num.id, SpamTestItem.status.in_(("queued", "calling")),
+                       SpamTestRun.status == "running")):
+        return "number is in a test run"
+    if is_awaiting(num, rules.test_expiry_hours):
+        return "number is awaiting a test result"
+    if rules.cooldown_hours > 0 and s.scalar(select(func.count()).select_from(Assignment).where(
+            Assignment.number_id == num.id, Assignment.end_reason == "taken_idle",
+            Assignment.ended_at >= now - timedelta(hours=rules.cooldown_hours))):
+        return "number was moved recently"
+    return None
+
+
+def lender_candidates(s: Session, receiver: Agent, provider: str | None, threshold: int) -> list[Agent]:
+    """Eligible lenders, best first: fewest connected calls on the number, then the number most
+    recently taken from the pool, then the lowest agent id."""
+    holders = s.scalars(select(Agent).where(Agent.current_number_id.is_not(None), Agent.id != receiver.id)).all()
+    ok = [a for a in holders if lender_block(s, a, receiver.id, provider, threshold) is None]
+
+    def rank(a: Agent):
+        taken = a.current_number.taken_from_pool_at
+        return (a.current_number.connected_count, 0 if taken else 1, -(taken.timestamp() if taken else 0), a.id)
+    return sorted(ok, key=rank)
+
+
+def _lock_pair(s: Session, a_id: int, b_id: int) -> None:
+    for agent_id in sorted((a_id, b_id)):  # a fixed order, so two moves can never deadlock
+        lock_agent(s, agent_id)
+
+
+def take_from_idle_agent(s: Session, receiver: Agent, provider: str | None, threshold: int, reason: str) -> Number | None:
+    """Move the best idle agent's number to `receiver`, in this one transaction. Every candidate is
+    re-checked under both agents' locks; one that changed is skipped. Returns the number, or None."""
+    for lender in lender_candidates(s, receiver, provider, threshold):
+        _lock_pair(s, receiver.id, lender.id)
+        s.expire(lender)
+        if active_call_count(s, receiver.id) > 0:
+            return None  # the receiver itself got busy: never move a number to an agent on a call
+        if lender_block(s, lender, receiver.id, provider, threshold) is not None:
+            continue
+        number = lender.current_number
+        now = utcnow()
+        a = s.scalar(select(Assignment).where(
+            Assignment.agent_id == lender.id, Assignment.number_id == number.id, Assignment.ended_at.is_(None)))
+        if a is not None:
+            a.ended_at, a.end_reason = now, "taken_idle"
+        lender.current_number_id = None
+        lender.number_taken_at = now
+        lender.number_taken_by_agent_id = receiver.id
+        lender.number_taken_reason = f"moved to {receiver.name} because this agent was idle"
+        lender.pool_empty = False
+        lender.waiting_since = None
+        s.flush()
+        s.expire(lender, ["current_number"])
+        _assign(s, receiver, number, reason, from_pool=False)  # counts on the number stay as they are
+        why = "threshold" if reason == "auto_idle_swap" else "spam"
+        add_event(s, number.id, "moved_idle",
+                  f"moved from {lender.name} (agent #{lender.id}) to {receiver.name} (agent #{receiver.id}): {why}")
+        log.info("idle swap: number %s moved from agent %s to agent %s (%s)", number.id, lender.id, receiver.id, why)
+        return number
+    return None
+
+
+def number_taken_error(s: Session, agent: Agent) -> AppError:
+    to = s.get(Agent, agent.number_taken_by_agent_id) if agent.number_taken_by_agent_id else None
+    when = agent.number_taken_at.strftime("%d %b %Y %H:%M UTC") if agent.number_taken_at else "an earlier date"
+    return AppError("NUMBER_TAKEN",
+                    f"No number. Its number was moved to {to.name if to else 'another agent'} on {when} "
+                    "because this agent was idle.", 409,
+                    taken_by_agent_id=agent.number_taken_by_agent_id)
+
+
+def set_never_lend(s: Session, agent_id: int, value: bool) -> Agent:
+    agent = lock_agent(s, agent_id)
+    agent.never_lend = bool(value)
+    s.flush()
+    return agent
 
 
 def settle_call(s: Session, call_id: int, execution: dict, min_seconds: float = 1.0) -> bool:
@@ -635,6 +803,8 @@ def begin_test_call(s: Session, agent_id: int, number_id: int, reviewer_phone: s
     that agent (the call lock applies) but never touches connected_count or total_calls."""
     reviewer_phone = validate_phone(reviewer_phone)
     agent = lock_agent(s, agent_id)
+    if agent.current_number_id is None and agent.number_taken_at is not None:
+        raise number_taken_error(s, agent)
     if agent.pending_switch and agent.pending_switch_reason == "spam":
         raise AppError("AGENT_SWITCHING", f"{agent.name} is waiting to swap a spam number.", 409)
     number = _get_number(s, number_id)
